@@ -1,0 +1,347 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const assert_1 = __importDefault(require("assert"));
+const mocha_1 = require("mocha");
+const audio_1 = require("../../src/common/audio");
+(0, mocha_1.afterEach)(function () {
+    (0, audio_1.setAudioMuted)(false);
+});
+// A stand-in for the extension's worker-side stream (see extension/emuworker.ts).
+class TestStream {
+    constructor(sampleRate) {
+        this.sampleRate = sampleRate;
+        this.chunks = [];
+        this.started = false;
+        this.stopped = false;
+    }
+    start() { this.started = true; }
+    stop() { this.stopped = true; }
+    push(samples) { this.chunks.push(samples); }
+}
+(0, mocha_1.describe)('SampleAudio streaming', function () {
+    (0, mocha_1.afterEach)(function () {
+        (0, audio_1.setAudioStreamFactory)(null);
+        (0, audio_1.setAudioMuted)(false);
+    });
+    (0, mocha_1.it)('hands full buffer chunks to the stream at the source rate', function () {
+        var stream;
+        (0, audio_1.setAudioStreamFactory)(() => (stream = new TestStream(48000)));
+        const audio = new audio_1.SampledAudio(48000); // source rate == stream rate, so sinc is 1
+        audio.start();
+        assert_1.default.ok(stream.started);
+        for (var i = 0; i < audio_1.AUDIO_CHUNK_SAMPLES; i++)
+            audio.feedSample(0.5, 1);
+        assert_1.default.equal(stream.chunks.length, 1);
+        assert_1.default.equal(stream.chunks[0].length, audio_1.AUDIO_CHUNK_SAMPLES);
+        assert_1.default.equal(stream.chunks[0][0], 0.5);
+        audio.stop();
+        assert_1.default.ok(stream.stopped);
+    });
+    (0, mocha_1.it)('resamples a lower source rate up to the stream rate', function () {
+        var stream;
+        (0, audio_1.setAudioStreamFactory)(() => (stream = new TestStream(48000)));
+        const audio = new audio_1.SampledAudio(24000); // sinc = 48000 / 24000 = 2
+        audio.start();
+        for (var i = 0; i < 24000; i++)
+            audio.feedSample(0.25, 1);
+        // 24000 source samples * 2 = 48000 output samples; the final partial
+        // buffer stays in SampleAudio until another chunk fills it
+        var full = Math.floor(48000 / audio_1.AUDIO_CHUNK_SAMPLES) * audio_1.AUDIO_CHUNK_SAMPLES;
+        var total = stream.chunks.reduce((n, c) => n + c.length, 0);
+        assert_1.default.equal(total, full);
+    });
+    (0, mocha_1.it)('reports its output rate once started', function () {
+        (0, audio_1.setAudioStreamFactory)(() => new TestStream(44100));
+        const audio = new audio_1.SampledAudio(15720);
+        audio.start();
+        assert_1.default.equal(audio.sampleRate, 44100);
+    });
+    (0, mocha_1.it)('start is idempotent, so resume does not recreate the stream', function () {
+        var count = 0;
+        var stream;
+        (0, audio_1.setAudioStreamFactory)(() => { count++; return (stream = new TestStream(48000)); });
+        const audio = new audio_1.SampledAudio(48000);
+        audio.start();
+        audio.start();
+        assert_1.default.equal(count, 1);
+        assert_1.default.ok(stream.started);
+    });
+});
+// A minimal Web Audio graph so the ScriptProcessor ring path (the only place
+// getStats has data) can run under Node.
+class FakeNode {
+    constructor() {
+        this.type = '';
+        this.frequency = { value: 0 };
+        this.gain = { value: 0 };
+    }
+    connect() { return this; }
+}
+class FakeScriptProcessorNode extends FakeNode {
+}
+class FakeAudioContext {
+    constructor() {
+        this.sampleRate = 44100;
+        this.state = 'running';
+        this.destination = new FakeNode();
+        this.scriptProcessor = new FakeScriptProcessorNode();
+        FakeAudioContext.last = this;
+    }
+    createBiquadFilter() { return new FakeNode(); }
+    createDynamicsCompressor() { return new FakeNode(); }
+    createGain() { return new FakeNode(); }
+    createScriptProcessor(_len, _in, _out) { return this.scriptProcessor; }
+    resume() { return Promise.resolve(); }
+    suspend() { return Promise.resolve(); }
+    close() { }
+}
+// A context that starts suspended, the way the browser hands one back when it is
+// created before the first user gesture.
+class SuspendedAudioContext extends FakeAudioContext {
+    constructor() {
+        super(...arguments);
+        this.state = 'suspended';
+        this.resumes = 0;
+    }
+    suspend() { this.state = 'suspended'; return Promise.resolve(); }
+    resume() { this.resumes++; this.state = 'running'; return Promise.resolve(); }
+}
+// Like a real context: resume() takes a moment, then fires statechange. Used to
+// check that the UI hint waits for Web Audio to actually start.
+class GestureAudioContext extends FakeAudioContext {
+    constructor() {
+        super(...arguments);
+        this.state = 'suspended';
+        this.stateListeners = [];
+    }
+    addEventListener(type, listener) {
+        if (type === 'statechange')
+            this.stateListeners.push(listener);
+    }
+    resume() {
+        return Promise.resolve().then(() => {
+            this.state = 'running';
+            for (const listener of this.stateListeners)
+                listener();
+        });
+    }
+    suspend() {
+        return Promise.resolve().then(() => {
+            this.state = 'suspended';
+            for (const listener of this.stateListeners)
+                listener();
+        });
+    }
+}
+const RING_BUFFER_SAMPLES = 2048;
+function withFakeAudio(fn) {
+    const prev = global.window;
+    global.window = { AudioContext: FakeAudioContext };
+    try {
+        return fn();
+    }
+    finally {
+        global.window = prev;
+    }
+}
+function feedBuffers(audio, buffers, value = 0.25) {
+    for (let i = 0; i < buffers * RING_BUFFER_SAMPLES; i++)
+        audio.feedSample(value, 1);
+}
+function pullBlock(length = RING_BUFFER_SAMPLES) {
+    const out = new Float32Array(length);
+    const node = FakeAudioContext.last.scriptProcessor;
+    node.onaudioprocess.call(node, { outputBuffer: { getChannelData: () => out }, srcElement: node });
+    return out;
+}
+(0, mocha_1.describe)('SampleAudio autoplay unlock', function () {
+    (0, mocha_1.afterEach)(function () {
+        (0, audio_1.setAudioStreamFactory)(null);
+    });
+    (0, mocha_1.it)('resumes a context that was created suspended', async function () {
+        const prev = global.window;
+        global.window = { AudioContext: SuspendedAudioContext };
+        try {
+            const audio = new audio_1.SampledAudio(44100);
+            audio.start();
+            const ctx = FakeAudioContext.last;
+            // the suspend()/resume() cycle is async so it can't race
+            await new Promise((r) => setTimeout(r, 0));
+            assert_1.default.equal(ctx.resumes, 1);
+            assert_1.default.equal(ctx.state, 'running');
+            // a later start (e.g. platform.resume()) must not recreate the graph
+            audio.start();
+            assert_1.default.equal(ctx.resumes, 1);
+        }
+        finally {
+            global.window = prev;
+        }
+    });
+    (0, mocha_1.it)('reports a context as blocked until its resume() resolves', async function () {
+        const ctx = new GestureAudioContext();
+        let changes = 0;
+        const unsubscribe = (0, audio_1.onAudioStateChange)(() => changes++);
+        (0, audio_1.resumeAudioContext)(ctx);
+        assert_1.default.equal((0, audio_1.isAudioBlocked)(), true);
+        await new Promise((r) => setTimeout(r, 0));
+        assert_1.default.equal(ctx.state, 'running');
+        assert_1.default.equal((0, audio_1.isAudioBlocked)(), false);
+        assert_1.default.ok(changes >= 2, 'expected registration and unlock notifications');
+        unsubscribe();
+    });
+    (0, mocha_1.it)('does not treat a context the IDE suspends as blocked', async function () {
+        const ctx = new GestureAudioContext();
+        (0, audio_1.resumeAudioContext)(ctx);
+        await new Promise((r) => setTimeout(r, 0));
+        assert_1.default.equal((0, audio_1.isAudioBlocked)(), false);
+        await ctx.suspend();
+        assert_1.default.equal((0, audio_1.isAudioBlocked)(), false);
+    });
+});
+(0, mocha_1.describe)('audio mute', function () {
+    (0, mocha_1.it)('mutes every graph, including ones created after muting', function () {
+        withFakeAudio(() => {
+            const first = new audio_1.SampledAudio(44100);
+            first.start();
+            const second = new audio_1.SampledAudio(44100);
+            second.start();
+            const firstGain = first.sa.gainNode;
+            const secondGain = second.sa.gainNode;
+            assert_1.default.equal(firstGain.gain.value, 1);
+            assert_1.default.equal(secondGain.gain.value, 1);
+            let changes = 0;
+            const unsubscribe = (0, audio_1.onAudioMuteChange)(() => changes++);
+            (0, audio_1.setAudioMuted)(true);
+            assert_1.default.equal((0, audio_1.isAudioMuted)(), true);
+            assert_1.default.equal(firstGain.gain.value, 0);
+            assert_1.default.equal(secondGain.gain.value, 0);
+            assert_1.default.equal(changes, 1);
+            const later = new audio_1.SampledAudio(44100);
+            later.start();
+            assert_1.default.equal(later.sa.gainNode.gain.value, 0);
+            (0, audio_1.setAudioMuted)(false);
+            assert_1.default.equal(firstGain.gain.value, 1);
+            assert_1.default.equal(secondGain.gain.value, 1);
+            assert_1.default.equal(later.sa.gainNode.gain.value, 1);
+            unsubscribe();
+        });
+    });
+});
+// MasterAudio used to let TSS's AudioLooper own a second AudioContext. It now
+// pulls its MasterChannel through the same SampleAudio graph, so this checks
+// the pull path, the shared more-than-one-output mute and the rate handshake.
+class FakeMasterChannel {
+    constructor() {
+        this.sampleRate = 44100;
+        this.bufferLength = 0;
+    }
+    setSampleRate(rate) { this.sampleRate = rate; }
+    setBufferLength(length) { this.bufferLength = length; this.buffer = new Int32Array(length); }
+    generate(length) { this.buffer.fill(8192); }
+    getBuffer() { return this.buffer; }
+}
+function withFakeTss(fn) {
+    const prev = global.MasterChannel;
+    global.MasterChannel = FakeMasterChannel;
+    try {
+        return fn();
+    }
+    finally {
+        global.MasterChannel = prev;
+    }
+}
+(0, mocha_1.describe)('MasterAudio', function () {
+    (0, mocha_1.it)('pulls TSS samples through SampleAudio and keeps one graph across resumes', function () {
+        withFakeAudio(() => withFakeTss(() => {
+            const audio = new audio_1.MasterAudio();
+            audio.start();
+            const ctx = FakeAudioContext.last;
+            const master = audio.master;
+            assert_1.default.equal(master.sampleRate, ctx.sampleRate);
+            const out = pullBlock(1024);
+            assert_1.default.equal(master.bufferLength, 2048);
+            assert_1.default.equal(out[0], 0.25); // 8192 / 32768, as AudioLooper did
+            assert_1.default.equal(out[1023], 0.25);
+            audio.stop();
+            audio.start();
+            assert_1.default.equal(FakeAudioContext.last, ctx, 'resume must not create a second AudioContext');
+        }));
+    });
+});
+(0, mocha_1.describe)('SampleAudio ring depth', function () {
+    (0, mocha_1.afterEach)(function () {
+        (0, audio_1.setAudioStreamFactory)(null);
+    });
+    (0, mocha_1.it)('fills to the full ring by default (behavior unchanged)', function () {
+        withFakeAudio(() => {
+            const audio = new audio_1.SampledAudio(44100);
+            audio.start();
+            const stats = audio.getStats();
+            assert_1.default.equal(stats.maxBuffers, 8);
+            assert_1.default.equal(stats.targetDepth, 8);
+            assert_1.default.equal(stats.sampleRate, 44100);
+        });
+    });
+    (0, mocha_1.it)('drops the oldest buffer when the producer laps the consumer', function () {
+        withFakeAudio(() => {
+            const audio = new audio_1.SampledAudio(44100);
+            audio.start();
+            feedBuffers(audio, 8); // no consumer yet, so the 8th commit trips depth 8
+            assert_1.default.equal(audio.getStats().skippedBuffers, 1);
+        });
+    });
+    (0, mocha_1.it)('serves committed buffers in order and records the fill', function () {
+        withFakeAudio(() => {
+            const audio = new audio_1.SampledAudio(44100);
+            audio.start();
+            audio.setStatsEnabled(true);
+            feedBuffers(audio, 2);
+            var out = pullBlock();
+            assert_1.default.equal(out[0], 0.25);
+            var stats = audio.getStats();
+            assert_1.default.equal(stats.samples, 1);
+            assert_1.default.equal(stats.underruns, 0);
+            assert_1.default.equal(stats.fillHistogram[2], 1); // two buffers outstanding when pulled
+            assert_1.default.equal(stats.meanFill, 2);
+            // draining past the producer is an underrun, not stale audio
+            pullBlock();
+            pullBlock();
+            assert_1.default.equal(audio.getStats().underruns, 1);
+        });
+    });
+    (0, mocha_1.it)('turns the resample ratio up when the ring runs dry', async function () {
+        await withFakeAudio(async () => {
+            const audio = new audio_1.SampledAudio(44100);
+            audio.start();
+            feedBuffers(audio, 1);
+            for (let i = 0; i < 20; i++)
+                pullBlock(); // drains, so fillAvg ends up below target
+            await new Promise((r) => setTimeout(r, 520));
+            feedBuffers(audio, 1); // first commit after the interval triggers an adjustment
+            const stats = audio.getStats();
+            assert_1.default.ok(stats.fillAvg < 1.5, 'expected a dry ring, got fillAvg=' + stats.fillAvg);
+            assert_1.default.ok(stats.trim > 1, 'expected trim > 1, got ' + stats.trim);
+        });
+    });
+    (0, mocha_1.it)('turns the resample ratio down when the ring is too full', async function () {
+        await withFakeAudio(async () => {
+            const audio = new audio_1.SampledAudio(44100);
+            audio.start();
+            feedBuffers(audio, 3);
+            pullBlock();
+            for (let i = 0; i < 20; i++) {
+                feedBuffers(audio, 1);
+                pullBlock();
+            } // holds fill at 3
+            await new Promise((r) => setTimeout(r, 520));
+            feedBuffers(audio, 1);
+            const stats = audio.getStats();
+            assert_1.default.ok(stats.fillAvg > 1.5, 'expected a full ring, got fillAvg=' + stats.fillAvg);
+            assert_1.default.ok(stats.trim < 1, 'expected trim < 1, got ' + stats.trim);
+        });
+    });
+});
+//# sourceMappingURL=testaudio.js.map

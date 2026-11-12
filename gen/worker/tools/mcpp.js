@@ -1,0 +1,138 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.preprocessMCPP = preprocessMCPP;
+exports.prepareCompilerInput = prepareCompilerInput;
+const util_1 = require("../../common/util");
+const toolmeta_1 = require("../../common/toolmeta");
+const builder_1 = require("../builder");
+const listingutils_1 = require("../listingutils");
+const platforms_1 = require("../platforms");
+const wasmutils_1 = require("../wasmutils");
+function makeCPPSafe(s) {
+    return s.replace(/[^A-Za-z0-9_]/g, '_');
+}
+/** Copy the headers under src.dir into an Emscripten FS at /share/include. */
+function copyWASIIncludes(FS, src) {
+    const prefix = src.dir + '/';
+    const made = new Set();
+    const mkdirs = (path) => {
+        let parts = path.split('/');
+        for (let i = 2; i < parts.length; i++) {
+            let dir = parts.slice(0, i).join('/');
+            if (!made.has(dir)) {
+                if (!FS.analyzePath(dir).exists)
+                    FS.mkdir(dir);
+                made.add(dir);
+            }
+        }
+    };
+    for (let file of src.fs.getFiles()) {
+        if (file.name.startsWith(prefix)) {
+            let path = '/share/include/' + file.name.substring(prefix.length);
+            mkdirs(path);
+            FS.writeFile(path, file.getBytes(), { encoding: 'binary' });
+        }
+    }
+}
+/**
+ * Preprocess the step's main source. `filesys` names the Emscripten FS
+ * package mounted at /share, or gives headers to copy into /share/include.
+ */
+function preprocessMCPP(step, filesys, extraArgs = []) {
+    var _a, _b;
+    (0, wasmutils_1.load)("mcpp");
+    var platform = step.platform;
+    var params = platforms_1.PLATFORM_PARAMS[platform] || platforms_1.PLATFORM_PARAMS[(0, util_1.getBasePlatform)(platform)];
+    if (!params)
+        throw Error("Platform not supported: " + platform);
+    // <stdin>:2: error: Can't open include file "foo.h"
+    var errors = [];
+    var match_fn = (0, listingutils_1.makeErrorMatcher)(errors, /<stdin>:(\d+): (.+)/, 1, 2, step.path);
+    var MCPP = wasmutils_1.emglobal.mcpp({
+        noInitialRun: true,
+        noFSInit: true,
+        print: wasmutils_1.print_fn,
+        printErr: match_fn,
+    });
+    var FS = MCPP.FS;
+    if (typeof filesys === 'string')
+        (0, wasmutils_1.setupFS)(FS, filesys);
+    else if (filesys)
+        copyWASIIncludes(FS, filesys);
+    (0, builder_1.populateFiles)(step, FS, {
+        mainFilePath: step.path,
+        processFn: (path, code) => {
+            if (typeof code === 'string') {
+                code = (0, builder_1.processEmbedDirective)(code);
+            }
+            return code;
+        }
+    });
+    (0, builder_1.populateExtraFiles)(step, FS, params.extra_compile_files);
+    // TODO: make configurable by other compilers
+    var arch = params.arch || 'z80';
+    var args = [
+        "-D", "__8BITWORKSHOP__",
+        "-D", "__SDCC_" + arch,
+        "-D", makeCPPSafe(platform.toUpperCase()),
+        "-I", "/share/include",
+        "-Q",
+        step.path, "main.i"
+    ];
+    if (step.mainfile) {
+        args.unshift.apply(args, ["-D", "__MAIN__"]);
+    }
+    let platform_def = platform.toUpperCase().replaceAll(/[^a-zA-Z0-9]/g, '_');
+    args.unshift.apply(args, ["-D", `__PLATFORM_${platform_def}__`]);
+    args.unshift(...extraArgs);
+    // //#symbol c NAME=VALUE: the compiler only sees preprocessed text, so the
+    // define has to reach mcpp for #ifdef/#ifndef (and array sizes) to see it
+    for (let d of ((_b = (_a = step.params) === null || _a === void 0 ? void 0 : _a.symbols) === null || _b === void 0 ? void 0 : _b.compiler) || [])
+        args.unshift("-D", d);
+    if (params.extra_preproc_args) {
+        args.push.apply(args, params.extra_preproc_args);
+    }
+    (0, wasmutils_1.execMain)(step, MCPP, args);
+    if (errors.length)
+        return { errors: errors };
+    var iout = FS.readFile("main.i", { encoding: 'utf8' });
+    // per-line, not `replace(/^#line /gm, ...)` -- the multiline global matcher
+    // overflows the small worker stack ("too much recursion") on large output
+    iout = iout.split('\n').map((line) => line.startsWith('#line ') ? '\n# ' + line.substring(6) : line).join('\n');
+    try {
+        var errout = FS.readFile("mcpp.err", { encoding: 'utf8' });
+        if (errout.length) {
+            // //main.c:2: error: Can't open include file "stdiosd.h"
+            var errors = (0, listingutils_1.extractErrors)(/([^:]+):(\d+): (.+)/, errout.split("\n"), step.path, 2, 3, 1);
+            if (errors.length == 0) {
+                errors = (0, builder_1.errorResult)(errout).errors;
+            }
+            return { errors: errors };
+        }
+    }
+    catch (e) {
+        //
+    }
+    return { code: iout };
+}
+/**
+ * Preprocess the step's main source with mcpp, load the result into the
+ * compiler's own filesystem, and prepend the tool's extra args and defines.
+ * Returns an error result, or null on success.
+ */
+function prepareCompilerInput(step, tool, FS, params, args) {
+    (0, builder_1.fixParamsWithDefines)(step.path, params); // before mcpp: //#symbol c reaches it
+    var preproc = preprocessMCPP(step, null);
+    if (preproc.errors)
+        return { errors: preproc.errors };
+    (0, builder_1.populateFiles)(step, FS);
+    FS.writeFile(step.path, preproc.code);
+    if (params.extra_compile_args) {
+        args.unshift.apply(args, params.extra_compile_args);
+    }
+    // //#symbol c / //#flag c
+    args.unshift.apply(args, (0, toolmeta_1.defineArgs)(tool, params.symbols && params.symbols.compiler)
+        .concat((0, toolmeta_1.extraArgsFor)(tool, params.buildArgs)));
+    return null;
+}
+//# sourceMappingURL=mcpp.js.map

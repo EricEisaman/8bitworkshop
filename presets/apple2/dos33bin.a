@@ -1,0 +1,115 @@
+; --------------------------------------------------
+; Example showing how to create a DOS 3.3 binary
+; header and program that is automatically loaded
+; into the desired PGM_START memory address.
+; --------------------------------------------------
+
+        processor 6502
+
+; --------------------------------------------------
+; Set PGM_START to desired start of program execution
+; - PGM_START must be less than $C000
+; - PGM_START + PGM_LENGTH must be less than $13000
+; --------------------------------------------------
+PGM_START    equ     $2000
+PGM_LENGTH   equ     PGM_END - PGM_START
+
+        seg
+        org PGM_START - 4 ; Subtract 4 bytes for header
+
+; --------------------------------------------------
+; DOS 3.3 binary header (4 bytes)
+; --------------------------------------------------
+        word PGM_START    ; Program start address in memory (2 bytes)
+        word PGM_LENGTH   ; Program length (2 bytes), must be file size - 4
+
+; --------------------------------------------------
+; ROM routines
+; --------------------------------------------------
+HOME    equ $FC58
+
+
+; --------------------------------------------------
+; Start of program
+; --------------------------------------------------
+PGM_START
+
+        ; --------------------------------------------------
+        ; Clear screen
+        ; --------------------------------------------------
+        jsr HOME
+
+        ; --------------------------------------------------
+        ; Print "PGM_START $" (11 chars) to $0400..$040a
+        ; --------------------------------------------------
+        ldx #0
+pfx_loop
+        lda prefix,x
+        ora #$80
+        sta $0400,x
+        inx
+        cpx #11
+        bne pfx_loop
+
+
+        ; --------------------------------------------------
+        ; Print origin in hex to $040b - $040e
+        ; --------------------------------------------------
+
+        ; High byte high nibble
+        lda #>PGM_START
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+        lda hexchar,x
+        ora #$80
+        sta $040b
+
+        ; High byte low nibble
+        lda #>PGM_START
+        and #$0F
+        tax
+        lda hexchar,x
+        ora #$80
+        sta $040c
+
+        ; Low byte high nibble
+        lda #<PGM_START
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+        lda hexchar,x
+        ora #$80
+        sta $040d
+
+        ; Low byte low nibble
+        lda #<PGM_START
+        and #$0F
+        tax
+        lda hexchar,x
+        ora #$80
+        sta $040e
+
+        ; --------------------------------------------------
+        ; Endless loop (text stays on screen)
+        ; --------------------------------------------------
+done    jmp done
+
+
+; --------------------------------------------------
+; Data
+; --------------------------------------------------
+prefix
+        .byte "PGM_START $"
+
+hexchar
+        .byte "0123456789ABCDEF"
+
+
+
+PGM_END
+ ; Don't add instructions after this line

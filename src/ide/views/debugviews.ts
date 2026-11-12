@@ -1,0 +1,1144 @@
+
+import { BaseZ80MachinePlatform, BaseZ80Platform } from "../../common/baseplatform";
+import { getMousePos } from "../../common/emu";
+import { getVisibleEditorLineHeight } from "../../common/vtextscroller";
+import { VirtualTextLine } from "../../common/vtextscroller";
+import { VirtualTextScroller } from "../../common/vtextscroller";
+import { ProbeFlags, ProbeRecorder, compactProbeLines } from "../../common/probe";
+import { hex, lpad, rpad, getFilenameForPath } from "../../common/util";
+import { VirtualList } from "../../common/vlist";
+import { computeMemoryMapLayout, stripeBounds, addressAtOffset, MemMapBlock, MemMapColumn } from "./memmaplayout";
+import { computeDumpLines } from "../../common/symbols/dumplines";
+import { current_project, getWorkerParams, lastDebugState, openLocationForPC, platform, projectWindows, runToPC, setupBreakpoint } from "../ui";
+import { bpStore, resolveBreakpoints, ResolvedBreakpoint } from "../breakpoints";
+import { newDiv, ProjectView } from "./baseviews";
+import { SourceEditor } from "./editors";
+
+///
+
+function ignoreSymbol(sym: string) {
+  return sym.endsWith('_SIZE__') || sym.endsWith('_LAST__') || sym.endsWith('STACKSIZE__') || sym.endsWith('FILEOFFS__')
+    || sym.startsWith('l__') || sym.startsWith('s__') || sym.startsWith('.__.');
+}
+
+// TODO: make it use debug state
+// TODO: make it safe (load/restore state?)
+// TODO: refactor w/ VirtualTextLine
+export class MemoryView implements ProjectView {
+  memorylist;
+  dumplines;
+  maindiv: HTMLElement;
+  recreateOnResize = true;
+  hibits = 0; // a hack to make it work with 32-bit addresses
+  totalRows = 0x1400; // a little more room in case we split lots of lines
+
+  createDiv(parent: HTMLElement) {
+    var div = document.createElement('div');
+    div.setAttribute("class", "memdump");
+    parent.appendChild(div);
+    this.showMemoryWindow(parent, div);
+    return this.maindiv = div;
+  }
+
+  gotoRow = -1; // row highlighted by the Go To Address prompt
+
+  showMemoryWindow(workspace: HTMLElement, parent: HTMLElement) {
+    const dumplines = this.getDumpLines();
+    this.memorylist = new VirtualList({
+      w: $(workspace).width(),
+      h: $(workspace).height(),
+      itemHeight: getVisibleEditorLineHeight(),
+      totalRows: Math.max(this.totalRows, dumplines ? dumplines.length : 0),
+      generatorFn: (row: number) => {
+        var s = this.getMemoryLineAt(row);
+        var linediv = document.createElement("div");
+        if (this.dumplines) {
+          var dlr = this.dumplines[row];
+          if (dlr) linediv.classList.add('seg_' + this.getMemorySegment(this.dumplines[row].a | this.hibits));
+        }
+        if (row == this.gotoRow) linediv.classList.add('goto_line');
+        linediv.appendChild(document.createTextNode(s));
+        return linediv;
+      }
+    });
+    $(parent).append(this.memorylist.container);
+    this.tick();
+    const compparams = getWorkerParams();
+    if (compparams && this.dumplines)
+      this.scrollToAddress(compparams.data_start);
+  }
+
+  scrollToAddress(addr: number) {
+    if (this.dumplines) {
+      this.hibits = addr & 0xffff0000;
+      this.memorylist.scrollToItem(this.findMemoryWindowLine(addr & 0xffff));
+    }
+  }
+
+  // jump to an address (or symbol), via the Go To Address prompt;
+  // centers the target row in the viewport and highlights it
+  goToAddress(addr: number) {
+    this.hibits = addr & 0xffff0000;
+    var dump = this.getDumpLines();
+    var row;
+    if (dump && dump.length) {
+      row = this.findMemoryWindowLine(addr & 0xffff);
+    } else {
+      // no symbol map (e.g. VRAM): rows are raw 16-byte chunks
+      row = (addr & 0xffff) >> 4;
+    }
+    if (row === undefined) return;
+    this.gotoRow = row;
+    if (this.memorylist) {
+      var c = this.memorylist.container;
+      var y = row * this.memorylist.itemHeight - (c.clientHeight - this.memorylist.itemHeight) / 2;
+      c.scrollTop = Math.max(0, y);
+    }
+    this.tick();
+  }
+
+  refresh() {
+    this.dumplines = null;
+    this.tick();
+  }
+
+  tick() {
+    if (this.memorylist) {
+      $(this.maindiv).find('[data-index]').each((i, e) => {
+        var div = $(e);
+        var row = parseInt(div.attr('data-index'));
+        var oldtext = div.text();
+        var newtext = this.getMemoryLineAt(row);
+        if (oldtext != newtext)
+          div.text(newtext);
+        div.toggleClass('goto_line', row == this.gotoRow);
+      });
+    }
+  }
+
+  getMemoryLineAt(row: number): string {
+    var offset = row * 16;
+    var n1 = 0;
+    var n2 = 16;
+    var sym;
+    if (this.getDumpLines()) {
+      var dl = this.dumplines[row];
+      if (dl) {
+        offset = dl.a & 0xfff0;
+        n1 = dl.a - offset;
+        n2 = n1 + dl.l;
+        sym = dl.s;
+      } else {
+        return '.';
+      }
+    }
+    var s = hex(offset + n1, 4) + ' ';
+    for (var i = 0; i < n1; i++) s += '   ';
+    if (n1 > 8) s += ' ';
+    for (var i = n1; i < n2; i++) {
+      var read = this.readAddress((offset + i) | this.hibits);
+      if (i == 8) s += ' ';
+      s += ' ' + (typeof read == 'number' ? hex(read, 2) : '??');
+    }
+    for (var i = n2; i < 16; i++) s += '   ';
+    if (sym) s += '  ' + sym;
+    return s;
+  }
+
+  readAddress(n: number) {
+    return platform.readAddress(n);
+  }
+
+  getDumpLineAt(line: number) {
+    var d = this.dumplines[line];
+    if (d) {
+      return d.a + " " + d.s;
+    }
+  }
+
+  // TODO: addr2symbol for ca65; and make it work without symbols
+  getDumpLines() {
+    var addr2sym = (platform.debugSymbols && platform.debugSymbols.addr2symbol) || {};
+    if (this.dumplines == null) {
+      // normalize the symbol lookup for the current address bank
+      var symmap = {};
+      for (const _nextofs of Object.keys(addr2sym)) {
+        var nextofs = parseInt(_nextofs); // convert from string (stupid JS)
+        symmap[nextofs] = addr2sym[nextofs | this.hibits];
+      }
+      this.dumplines = computeDumpLines(symmap, platform.debugSymbols?.symbolsizes,
+        current_project && current_project.segments, ignoreSymbol);
+    }
+    return this.dumplines;
+  }
+
+  // TODO: use segments list?
+  getMemorySegment(a: number): string {
+    const compparams = getWorkerParams();
+    if (compparams) {
+      if (a >= compparams.data_start && a < compparams.data_start + compparams.data_size) {
+        if (platform.getSP && a >= platform.getSP() - 15)
+          return 'stack';
+        else
+          return 'data';
+      }
+      else if (a >= compparams.code_start && a < compparams.code_start + (compparams.code_size || compparams.rom_size))
+        return 'code';
+    }
+    var segments = current_project.segments;
+    if (segments) {
+      for (var seg of segments) {
+        if (a >= seg.start && a < seg.start + seg.size) {
+          if (seg.type == 'rom') return 'code';
+          if (seg.type == 'ram') return 'data';
+          if (seg.type == 'io') return 'io';
+        }
+      }
+    }
+    return 'unknown';
+  }
+
+  findMemoryWindowLine(a: number): number {
+    for (var i = 0; i < this.dumplines.length; i++)
+      if (this.dumplines[i].a >= a)
+        return i;
+  }
+}
+
+export class VRAMMemoryView extends MemoryView {
+  totalRows = 0x800;
+  readAddress(n: number) {
+    return platform.readVRAMAddress(n);
+  }
+  getMemorySegment(a: number): string {
+    return 'video';
+  }
+  getDumpLines() {
+    return null;
+  }
+}
+
+///
+
+export class BinaryFileView implements ProjectView {
+  vlist: VirtualTextScroller;
+  parent: HTMLElement;
+  maindiv: HTMLElement;
+  path: string;
+  data: Uint8Array;
+  recreateOnResize = true;
+
+  constructor(path: string, data: Uint8Array) {
+    this.path = path;
+    this.data = data;
+  }
+
+  private populateVlist() {
+    $(this.vlist.maindiv).empty();
+    this.vlist.create(this.parent, ((this.data.length + 15) >> 4), this.getMemoryLineAt.bind(this));
+  }
+
+  createDiv(parent: HTMLElement) {
+    this.parent = parent;
+    this.vlist = new VirtualTextScroller(this.parent);
+    this.populateVlist();
+    return this.vlist.maindiv;
+  }
+
+  setData(data: Uint8Array) {
+    this.data = data;
+    this.populateVlist();
+  }
+
+  getMemoryLineAt(row: number): VirtualTextLine {
+    var offset = row * 16;
+    var n1 = 0;
+    var n2 = 16;
+    var s = hex(offset + n1, 4) + ' ';
+    for (var i = 0; i < n1; i++) s += '   ';
+    if (n1 > 8) s += ' ';
+    for (var i = n1; i < n2; i++) {
+      var read = this.data[offset + i];
+      if (i == 8) s += ' ';
+      s += ' ' + (read >= 0 ? hex(read, 2) : '  ');
+    }
+    return { text: s };
+  }
+
+  refresh() {
+    this.vlist.refresh();
+  }
+
+  getPath() { return this.path; }
+}
+
+///
+
+export class MemoryMapView implements ProjectView {
+  maindiv: JQuery;
+  scrubRows: { bounds: number[], heights: number[] } = null;
+  scrubOverlay: JQuery = null;
+  scrubLabel: JQuery = null;
+
+  createDiv(parent: HTMLElement) {
+    this.maindiv = newDiv(parent, 'vertical-scroll memmap');
+    return this.maindiv[0];
+  }
+
+  addBlock(block: MemMapBlock, col: MemMapColumn, colstart: number, bounds: number[]) {
+    var div = $('<div class="segment"/>');
+    var describe = (b: MemMapBlock) =>
+      `${b.name ? b.name + ': ' : ''}$${hex(b.start, 4)} - $${hex(b.end - 1, 4)} (${b.approx ? '~' : ''}${b.end - b.start} bytes)`;
+    var hidden = block.hidden || [];
+    div.text(block.name + (hidden.length ? ` +${hidden.length}` : ''));
+    div.attr('title', [block].concat(hidden).map(describe).join('\n'));
+    if (block.type) div.addClass('segment-' + block.type);
+    // widen into lanes to the right that are free over this range
+    var span = col.lanes - block.lane;
+    for (var other of col.blocks) {
+      if (other.lane > block.lane && other.start < block.end && other.end > block.start)
+        span = Math.min(span, other.lane - block.lane);
+    }
+    div.css('grid-row', `${bounds.indexOf(block.start) + 2} / ${bounds.indexOf(block.end) + 2}`);
+    div.css('grid-column', `${colstart + block.lane} / span ${span}`);
+    div.click(() => {
+      // TODO: what if memory browser does not exist?
+      var memview = projectWindows.createOrShow('#memory') as MemoryView;
+      memview.scrollToAddress(block.start);
+    });
+    this.maindiv.append(div);
+  }
+
+  refresh() {
+    this.maindiv.empty();
+    var layout = computeMemoryMapLayout(current_project.segments, platform.debugSymbols?.symbolmap, null, platform.debugSymbols?.symbolsizes);
+    var bounds = layout.bounds;
+    if (!bounds.length) return;
+    // add $1000-aligned rows (with borrowed heights) so we can stripe the map
+    var stripe = stripeBounds(bounds);
+    var xbounds = stripe ? stripe.bounds : bounds;
+    // columns: address, then one grid column per lane
+    var cols = ['5em'];
+    var colstart = 2;
+    var header = $('<div class="memmap-header" style="grid-row:1;grid-column:1"/>').text('Address');
+    this.maindiv.append(header);
+    if (stripe) {
+      // background stripes, painted before the segments so they sit behind them
+      for (var i = 0; i + 1 < xbounds.length; i++) {
+        var parity = Math.floor(xbounds[i] / 0x1000) % 2;
+        $('<div class="memmap-stripe"/>')
+          .addClass(parity ? 'memmap-stripe-odd' : 'memmap-stripe-even')
+          .css('grid-row', `${i + 2}`)
+          .css('grid-column', '1 / -1')
+          .appendTo(this.maindiv);
+      }
+    }
+    for (var col of layout.columns) {
+      for (var i = 0; i < col.lanes; i++) cols.push('minmax(0,1fr)');
+      $('<div class="memmap-header"/>')
+        .text(col.title)
+        .css('grid-row', '1')
+        .css('grid-column', `${colstart} / span ${col.lanes}`)
+        .appendTo(this.maindiv);
+      for (var block of col.blocks) this.addBlock(block, col, colstart, xbounds);
+      colstart += col.lanes;
+    }
+    // rows: header, then one row per address range
+    var rows = ['auto'];
+    var rowHeights: number[] = [];
+    for (var i = 0; i + 1 < xbounds.length; i++) {
+      var size = xbounds[i + 1] - xbounds[i];
+      var h = Math.max(3.0, Math.log(size + 1)) * 0.5;
+      if (stripe) {
+        var parent = stripe.parents[i];
+        var psize = bounds[parent + 1] - bounds[parent];
+        h = Math.max(3.0, Math.log(psize + 1)) * 0.5 * stripe.weights[i];
+      }
+      rows.push(h + 'em');
+      rowHeights.push(h);
+    }
+    for (var i = 0; i + 1 < bounds.length; i++) {
+      $('<div class="segment-offset"/>')
+        .text('$' + hex(bounds[i], 4))
+        .css('grid-row', `${xbounds.indexOf(bounds[i]) + 2}`)
+        .css('grid-column', '1')
+        .appendTo(this.maindiv);
+    }
+    // hover the address column to read the address under the cursor
+    this.scrubRows = { bounds: xbounds, heights: rowHeights };
+    this.scrubOverlay = $('<div class="memmap-scrub"/>')
+      .css('grid-row', '2 / -1')
+      .css('grid-column', '1')
+      .on('mousemove', (e) => this.scrubTo(e))
+      .on('mouseleave', () => this.hideScrub())
+      .appendTo(this.maindiv);
+    this.maindiv.css('grid-template-columns', cols.join(' '));
+    this.maindiv.css('grid-template-rows', rows.join(' '));
+  }
+
+  scrubTo(e: { clientX: number, clientY: number }) {
+    if (!this.scrubRows || !this.scrubOverlay) return;
+    var rect = this.scrubOverlay[0].getBoundingClientRect();
+    var bounds = this.scrubRows.bounds;
+    var heights = this.scrubRows.heights;
+    var total = 0;
+    for (var h of heights) total += h;
+    // cursor position in "row height" units, then within a row in address units
+    var y = (e.clientY - rect.top) / rect.height * total;
+    var addr = addressAtOffset(bounds, heights, y);
+    if (!this.scrubLabel) this.scrubLabel = $('<div class="memmap-scrub-label"/>').appendTo(document.body);
+    this.scrubLabel.text('$' + hex(addr, 4))
+      .css({ left: (e.clientX + 12) + 'px', top: (e.clientY + 12) + 'px' })
+      .show();
+  }
+
+  hideScrub() {
+    if (this.scrubLabel) this.scrubLabel.hide();
+  }
+
+}
+
+///
+
+// TODO: clear buffer when scrubbing
+
+const OPAQUE_BLACK = 0xff000000;
+
+export abstract class ProbeViewBaseBase {
+  probe: ProbeRecorder;
+  tooldiv: HTMLElement;
+  cumulativeData: boolean = false;
+  cyclesPerLine: number;
+  totalScanlines: number;
+  sp: number; // stack pointer
+
+  abstract tick(): void;
+
+  constructor() {
+    var width = 160;
+    var height = 262; // TODO: PAL?
+    try {
+      width = Math.ceil(platform['machine']['cpuCyclesPerLine']) || width; // TODO
+      height = Math.ceil(platform['machine']['numTotalScanlines']) || height; // TODO
+    } catch (e) {
+    }
+    this.cyclesPerLine = width;
+    this.totalScanlines = height;
+  }
+
+  addr2symbol(addr: number): string {
+    var _addr2sym = (platform.debugSymbols && platform.debugSymbols.addr2symbol) || {};
+    return _addr2sym[addr];
+  }
+
+  addr2str(addr: number): string {
+    var sym = this.addr2symbol(addr);
+    if (typeof sym === 'string')
+      return '$' + hex(addr) + ' (' + sym + ')';
+    else
+      return '$' + hex(addr);
+  }
+
+  showTooltip(s: string) {
+    if (s) {
+      if (!this.tooldiv) {
+        this.tooldiv = document.createElement("div");
+        this.tooldiv.setAttribute("class", "tooltiptrack");
+        document.body.appendChild(this.tooldiv);
+      }
+      $(this.tooldiv).text(s).show();
+    } else {
+      $(this.tooldiv).hide();
+    }
+  }
+
+  setVisible(showing: boolean): void {
+    if (showing) {
+      this.probe = platform.startProbing();
+      this.probe.singleFrame = !this.cumulativeData;
+      this.tick();
+    } else {
+      if (this.probe) this.probe.singleFrame = true;
+      platform.stopProbing();
+      this.probe = null;
+    }
+  }
+
+  /** Replays the probe buffer through eventfn; returns the clocks it covered. */
+  redraw(eventfn: (op, addr, col, row, clk, value) => void): number {
+    var p = this.probe;
+    if (!p || !p.idx) return 0; // if no probe, or if empty
+    var row = 0;
+    var col = 0;
+    var clk = 0;
+    this.sp = 0;
+    for (var i = 0; i < p.idx; i++) {
+      var word = p.buf[i];
+      var addr = word & 0xffff;
+      var value = (word >> 16) & 0xff;
+      var op = word & OPAQUE_BLACK;
+      switch (op) {
+        case ProbeFlags.SCANLINE: row++; col = 0; break;
+        case ProbeFlags.FRAME: row = 0; col = 0; break;
+        case ProbeFlags.CLOCKS: col += addr; clk += addr; break;
+        case ProbeFlags.SP_PUSH:
+        case ProbeFlags.SP_POP:
+          this.sp = addr;
+        default:
+          eventfn(op, addr, col, row, clk, value);
+          break;
+      }
+    }
+    return clk;
+  }
+
+  opToString(op: number, addr?: number, value?: number) {
+    var s = "";
+    switch (op) {
+      case ProbeFlags.EXECUTE: s = "Exec"; break;
+      case ProbeFlags.MEM_READ: s = "Read"; break;
+      case ProbeFlags.MEM_WRITE: s = "Write"; break;
+      case ProbeFlags.IO_READ: s = "IO Read"; break;
+      case ProbeFlags.IO_WRITE: s = "IO Write"; break;
+      case ProbeFlags.VRAM_READ: s = "VRAM Read"; break;
+      case ProbeFlags.VRAM_WRITE: s = "VRAM Write"; break;
+      case ProbeFlags.DMA_READ: s = "DMA Read"; break;
+      case ProbeFlags.DMA_WRITE: s = "DMA Write"; break;
+      case ProbeFlags.INTERRUPT: s = "Interrupt"; break;
+      case ProbeFlags.ILLEGAL: s = "Error"; break;
+      case ProbeFlags.WAIT: s = "Wait"; break;
+      case ProbeFlags.SP_PUSH: s = "Stack Push"; break;
+      case ProbeFlags.SP_POP: s = "Stack Pop"; break;
+      default: return "";
+    }
+    if (typeof addr == 'number') s += " " + this.addr2str(addr);
+    if ((op & ProbeFlags.HAS_VALUE) && typeof value == 'number') s += " = $" + hex(value, 2);
+    return s;
+  }
+
+  getOpRGB(op: number, addr: number): number {
+    switch (op) {
+      case ProbeFlags.EXECUTE: return 0x018001;
+      case ProbeFlags.MEM_READ: return 0x800101;
+      case ProbeFlags.MEM_WRITE: return 0x010180;
+      case ProbeFlags.IO_READ: return 0x018080;
+      case ProbeFlags.IO_WRITE: return 0xc00180;
+      case ProbeFlags.DMA_READ:
+      case ProbeFlags.VRAM_READ: return 0x808001;
+      case ProbeFlags.DMA_WRITE:
+      case ProbeFlags.VRAM_WRITE: return 0x4080c0;
+      case ProbeFlags.INTERRUPT: return 0x3fbf3f;
+      case ProbeFlags.ILLEGAL: return 0x3f3fff;
+      case ProbeFlags.WAIT: return 0xff3f3f;
+      default: return 0;
+    }
+  }
+}
+
+abstract class ProbeViewBase extends ProbeViewBaseBase {
+
+  maindiv: HTMLElement;
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  recreateOnResize = true;
+
+  abstract drawEvent(op, addr, col, row);
+
+  createCanvas(parent: HTMLElement, width: number, height: number) {
+    var div = document.createElement('div');
+    var canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.classList.add('pixelated');
+    canvas.style.width = '100%';
+    canvas.style.height = '90vh'; // i hate css
+    canvas.style.backgroundColor = 'black';
+    canvas.style.cursor = 'crosshair';
+    canvas.onmousemove = (e) => {
+      var pos = getMousePos(canvas, e);
+      this.showTooltip(this.getTooltipText(pos.x, pos.y));
+      $(this.tooldiv).css('left', e.pageX + 10).css('top', e.pageY - 30);
+    }
+    canvas.onmouseout = (e) => {
+      $(this.tooldiv).hide();
+    }
+    parent.appendChild(div);
+    div.appendChild(canvas);
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.initCanvas();
+    return this.maindiv = div;
+  }
+
+  initCanvas() {
+  }
+
+  getTooltipText(x: number, y: number): string {
+    return null;
+  }
+
+  getOpAtPos(x: number, y: number, mask: number): number {
+    x = x | 0;
+    y = y | 0;
+    let result = 0;
+    this.redraw((op, addr, col, row, clk, value) => {
+      if (!result && row == y && col >= x && (op & mask) != 0) {
+        result = op | addr;
+      }
+    });
+    return result;
+  }
+
+  clear() {
+  }
+
+  tick() {
+    this.clear();
+    this.redraw(this.drawEvent.bind(this));
+  }
+}
+
+abstract class ProbeBitmapViewBase extends ProbeViewBase {
+
+  imageData: ImageData;
+  datau32: Uint32Array;
+  recreateOnResize = false;
+
+  createDiv(parent: HTMLElement) {
+    return this.createCanvas(parent, this.cyclesPerLine, this.totalScanlines);
+  }
+  initCanvas() {
+    this.imageData = this.ctx.createImageData(this.canvas.width, this.canvas.height);
+    this.datau32 = new Uint32Array(this.imageData.data.buffer);
+  }
+  getTooltipText(x: number, y: number): string {
+    x = x | 0;
+    y = y | 0;
+    var s = "";
+    var lastroutine = null;
+    var symstack = [];
+    var lastcol = -1;
+    this.redraw((op, addr, col, row, clk, value) => {
+      switch (op) {
+        case ProbeFlags.EXECUTE:
+          lastroutine = this.addr2symbol(addr) || lastroutine;
+          break;
+        case ProbeFlags.SP_PUSH:
+          symstack.push(lastroutine);
+          break;
+        case ProbeFlags.SP_POP:
+          lastroutine = symstack.pop();
+          break;
+      }
+      if (row == y && col <= x) {
+        if (col != lastcol) {
+          s = "";
+          lastcol = col;
+        }
+        if (s == "" && lastroutine) { s += "\n" + lastroutine; }
+        s += "\n" + this.opToString(op, addr, value);
+      }
+    });
+    return 'X: ' + x + '  Y: ' + y + ' ' + s;
+  }
+
+  refresh() {
+    this.tick();
+    this.datau32.fill(OPAQUE_BLACK);
+  }
+  tick() {
+    super.tick();
+    this.drawImage();
+  }
+  drawImage() {
+    this.ctx.putImageData(this.imageData, 0, 0);
+  }
+  clear() {
+    this.datau32.fill(OPAQUE_BLACK);
+  }
+}
+
+export class AddressHeatMapView extends ProbeBitmapViewBase implements ProjectView {
+
+  createDiv(parent: HTMLElement) {
+    return this.createCanvas(parent, 256, 256);
+  }
+
+  initCanvas() {
+    super.initCanvas();
+    this.canvas.onclick = (e) => {
+      var pos = getMousePos(this.canvas, e);
+      var opaddr = Math.floor(pos.x) + Math.floor(pos.y) * 256;
+      var lastpc = -1;
+      var runpc = -1;
+      this.redraw((op, addr) => {
+        if (runpc < 0 && lastpc >= 0 && addr == opaddr) {
+          runpc = lastpc;
+        }
+        if (op == ProbeFlags.EXECUTE) lastpc = addr;
+      });
+      if (runpc >= 0) runToPC([runpc]);
+    }
+  }
+
+  clear() {
+    for (var i = 0; i <= 0xffff; i++) {
+      var v = platform.readAddress(i);
+      var rgb = (v >> 2) | (v & 0x1f);
+      rgb |= (rgb << 8) | (rgb << 16);
+      this.datau32[i] = rgb | OPAQUE_BLACK;
+    }
+  }
+
+  // TODO: show current PC
+  drawEvent(op, addr, col, row) {
+    var rgb = this.getOpRGB(op, addr);
+    if (!rgb) return;
+    var x = addr & 0xff;
+    var y = (addr >> 8) & 0xff;
+    var data = this.datau32[addr & 0xffff];
+    data = data | rgb | OPAQUE_BLACK;
+    this.datau32[addr & 0xffff] = data;
+  }
+
+  getTooltipText(x: number, y: number): string {
+    var a = (x & 0xff) + (y << 8);
+    var s = "";
+    var pc = -1;
+    var already = {};
+    var lastroutine = null;
+    var symstack = [];
+    this.redraw((op, addr, col, row, clk, value) => {
+      switch (op) {
+        case ProbeFlags.EXECUTE:
+          pc = addr;
+          lastroutine = this.addr2symbol(addr) || lastroutine;
+          break;
+        case ProbeFlags.SP_PUSH:
+          symstack.push(lastroutine);
+          break;
+        case ProbeFlags.SP_POP:
+          lastroutine = symstack.pop();
+          break;
+      }
+      var key = op | pc;
+      if (addr == a && !already[key]) {
+        if (s == "" && lastroutine) { s += "\n" + lastroutine; }
+        s += "\nPC " + this.addr2str(pc) + " " + this.opToString(op, null, value);
+        already[key] = 1;
+      }
+    });
+    return this.addr2str(a) + s;
+  }
+}
+
+export class RasterPCHeatMapView extends ProbeBitmapViewBase implements ProjectView {
+
+  initCanvas() {
+    super.initCanvas();
+    // TODO: run to exact x/y position
+    this.canvas.onclick = (e) => {
+      var pos = getMousePos(this.canvas, e);
+      var x = Math.floor(pos.x);
+      var y = Math.floor(pos.y);
+      var opaddr = this.getOpAtPos(pos.x, pos.y, ProbeFlags.EXECUTE);
+      if (opaddr) {
+        //runToPC(opaddr & 0xffff);
+        setupBreakpoint("toline");
+        platform.runEval(() => {
+          let onrow = platform.getRasterScanline && platform.getRasterScanline() >= y;
+          if (onrow && platform.getRasterLineClock) {
+            return onrow && platform.getRasterLineClock() > x;
+          } else return onrow;
+        });
+      }
+    }
+  }
+
+  drawEvent(op, addr, col, row) {
+    var rgb = this.getOpRGB(op, addr);
+    if (!rgb) return;
+    var iofs = col + row * this.canvas.width;
+    var data = rgb | OPAQUE_BLACK;
+    this.datau32[iofs] |= data;
+  }
+
+  drawImage() {
+    // fill in the gaps
+    let last = OPAQUE_BLACK;
+    for (let i = 0; i < this.datau32.length; i++) {
+      if (this.datau32[i] == OPAQUE_BLACK) {
+        this.datau32[i] = last;
+      } else {
+        last = this.datau32[i];
+      }
+    }
+    super.drawImage();
+  }
+}
+
+export class RasterStackMapView extends RasterPCHeatMapView implements ProjectView {
+
+  interrupt: number = 0;
+  rgb: number = 0;
+  lastpc: number = 0;
+
+  drawEvent(op, addr, col, row) {
+    var iofs = col + row * this.canvas.width;
+    // track interrupts
+    if (op == ProbeFlags.INTERRUPT) this.interrupt = 1;
+    if (this.interrupt == 1 && op == ProbeFlags.SP_PUSH) this.interrupt = addr;
+    if (this.interrupt > 1 && this.sp > this.interrupt) this.interrupt = 0;
+    // track writes
+    if (op == ProbeFlags.MEM_WRITE) { this.rgb |= 0x00002f; }
+    if (op == ProbeFlags.VRAM_WRITE) { this.rgb |= 0x003f80; }
+    if (op == ProbeFlags.IO_WRITE) { this.rgb |= 0x1f3f80; }
+    if (op == ProbeFlags.IO_READ) { this.rgb |= 0x001f00; }
+    if (op == ProbeFlags.WAIT) { this.rgb = 0x008000; }
+    // draw pixels?
+    if (op == ProbeFlags.ILLEGAL || op == ProbeFlags.DMA_READ) {
+      this.datau32[iofs] = 0xff0f0f0f;
+    } else {
+      let data = this.rgb;
+      if (op == ProbeFlags.EXECUTE) {
+        let sp = this.sp & 15;
+        if (sp >= 8) sp = 16 - sp;
+        if (Math.abs(this.lastpc) - addr > 16) { sp += 1; }
+        if (Math.abs(this.lastpc) - addr > 256) { sp += 1; }
+        data = this.rgb = (0x080808 * sp) + 0x202020;
+        this.lastpc = addr;
+      }
+      if (this.interrupt) { data |= 0x800040; }
+      if (this.datau32[iofs] == OPAQUE_BLACK) {
+        this.datau32[iofs] = data | OPAQUE_BLACK;
+      }
+    }
+  }
+}
+
+export class ProbeLogView extends ProbeViewBaseBase {
+  vlist: VirtualTextScroller;
+  maindiv: HTMLElement;
+  recreateOnResize = true;
+  dumplines;
+  lines;
+
+  createDiv(parent: HTMLElement) {
+    this.vlist = new VirtualTextScroller(parent);
+    this.vlist.create(parent, this.cyclesPerLine * this.totalScanlines, this.getMemoryLineAt.bind(this));
+    return this.vlist.maindiv;
+  }
+  getMemoryLineAt(row: number): VirtualTextLine {
+    var s: string = "";
+    var c: string = "seg_data";
+    var line = this.lines && this.lines[row];
+    if (line != null) {
+      var xtra: string = line.info.join(", ");
+      s = "(" + lpad(line.row, 4) + ", " + lpad(line.col, 4) + ")  " + rpad(line.asm || "", 20) + xtra;
+      if (xtra.indexOf("Write ") >= 0) c = "seg_io";
+      // if (xtra.indexOf("Stack ") >= 0) c = "seg_code";
+    }
+    return { text: s, clas: c };
+  }
+  refresh() {
+    this.tick();
+  }
+  tick() {
+    const isz80 = platform instanceof BaseZ80MachinePlatform || platform instanceof BaseZ80Platform; // TODO?
+    // cache each line in frame
+    this.dumplines = {};
+    this.redraw((op, addr, col, row, clk, value) => {
+      if (isz80) clk >>= 2;
+      var line = this.dumplines[clk];
+      if (line == null) {
+        line = { op: op, addr: addr, row: row, col: col, asm: null, info: [] };
+        this.dumplines[clk] = line;
+      }
+      switch (op) {
+        case ProbeFlags.EXECUTE:
+          if (platform.disassemble) {
+            var disasm = platform.disassemble(addr, platform.readAddress.bind(platform));
+            line.asm = disasm && disasm.line;
+          }
+          break;
+        default:
+          var xtra = this.opToString(op, addr, value);
+          if (xtra != "") line.info.push(xtra);
+          break;
+      }
+    });
+    // drop the empty rows between events, so the list has no blank lines
+    this.lines = compactProbeLines(this.dumplines);
+    this.vlist.setRowCount(this.lines.length);
+    this.vlist.refresh();
+  }
+}
+
+export class ScanlineIOView extends ProbeViewBaseBase {
+  vlist: VirtualTextScroller;
+  maindiv: HTMLElement;
+  recreateOnResize = true;
+  dumplines;
+
+  createDiv(parent: HTMLElement) {
+    this.vlist = new VirtualTextScroller(parent);
+    this.vlist.create(parent, this.totalScanlines, this.getMemoryLineAt.bind(this));
+    return this.vlist.maindiv;
+  }
+  getMemoryLineAt(row: number): VirtualTextLine {
+    var s = lpad(row + "", 3) + ' ';
+    var c = 'seg_code';
+    var line = (this.dumplines && this.dumplines[row]) || [];
+    var hblankCycle = Math.round(this.cyclesPerLine / 3.3);
+    for (var i = 0; i < this.cyclesPerLine; i++) {
+      var opaddr = line[i];
+      if (opaddr !== undefined) {
+        var addr = opaddr & 0xffff;
+        var op = op & OPAQUE_BLACK;
+        if (op == ProbeFlags.EXECUTE) {
+          s += ',';
+        } else {
+          var v = hex(addr);
+          s += v;
+          i += v.length - 1;
+        }
+      } else {
+        s += (i == hblankCycle) ? '|' : '.';
+      }
+    }
+    if (line[-1]) s += ' ' + line[-1]; // executing symbol
+    return { text: s, clas: c };
+  }
+  refresh() {
+    this.tick();
+  }
+  tick() {
+    const isz80 = platform instanceof BaseZ80MachinePlatform || platform instanceof BaseZ80Platform; // TODO?
+    // cache each line in frame
+    this.dumplines = {};
+    this.redraw((op, addr, col, row, clk, value) => {
+      var line = this.dumplines[row];
+      if (line == null) {
+        this.dumplines[row] = line = [];
+      }
+      switch (op) {
+        case ProbeFlags.EXECUTE:
+          var sym = platform.debugSymbols.addr2symbol[addr];
+          if (sym) line[-1] = sym;
+          break;
+        //case ProbeFlags.MEM_WRITE:
+        case ProbeFlags.IO_READ:
+        case ProbeFlags.IO_WRITE:
+        case ProbeFlags.VRAM_READ:
+        case ProbeFlags.VRAM_WRITE:
+          line[col] = op | addr;
+          break;
+      }
+    });
+    this.vlist.refresh();
+  }
+}
+
+///
+
+export class ProbeSymbolView extends ProbeViewBaseBase {
+  vlist: VirtualTextScroller;
+  keys: string[];
+  recreateOnResize = true;
+  dumplines;
+  cumulativeData = true;
+
+  // TODO: auto resize
+  createDiv(parent: HTMLElement) {
+    // TODO: what if symbol list changes?
+    if (platform.debugSymbols && platform.debugSymbols.symbolmap) {
+      this.keys = Array.from(Object.keys(platform.debugSymbols.symbolmap).filter(sym => !ignoreSymbol(sym)));
+    } else {
+      this.keys = ['no symbols defined'];
+    }
+    this.vlist = new VirtualTextScroller(parent);
+    this.vlist.create(parent, this.keys.length + 1, this.getMemoryLineAt.bind(this));
+    return this.vlist.maindiv;
+  }
+
+  getMemoryLineAt(row: number): VirtualTextLine {
+    // header line
+    if (row == 0) {
+      return { text: lpad("Symbol", 35) + lpad("Reads", 8) + lpad("Writes", 8) };
+    }
+    var sym = this.keys[row - 1];
+    var line = this.dumplines && this.dumplines[sym];
+    function getop(op) {
+      var n = line[op] | 0;
+      return lpad(n ? n.toString() : "", 8);
+    }
+    var s: string;
+    var c: string;
+    if (line != null) {
+      s = lpad(sym, 35)
+        + getop(ProbeFlags.MEM_READ)
+        + getop(ProbeFlags.MEM_WRITE);
+      if (line[ProbeFlags.EXECUTE])
+        c = 'seg_code';
+      else if (line[ProbeFlags.IO_READ] || line[ProbeFlags.IO_WRITE])
+        c = 'seg_io';
+      else
+        c = 'seg_data';
+    } else {
+      s = lpad(sym, 35);
+      c = 'seg_unknown';
+    }
+    return { text: s, clas: c };
+  }
+
+  refresh() {
+    this.tick();
+  }
+
+  tick() {
+    // cache each line in frame
+    this.dumplines = {};
+    this.redraw((op, addr, col, row, clk, value) => {
+      var sym = platform.debugSymbols.addr2symbol[addr];
+      if (sym != null) {
+        var line = this.dumplines[sym];
+        if (line == null) {
+          line = {};
+          this.dumplines[sym] = line;
+        }
+        line[op] = (line[op] | 0) + 1;
+      }
+    });
+    this.vlist.refresh();
+    if (this.probe) this.probe.clear(); // clear cumulative data (TODO: doesnt work with seeking or debugging)
+  }
+}
+
+///
+
+export class BreakpointsView implements ProjectView {
+  maindiv: JQuery;
+  editingId: number = null; // breakpoint being edited in the add form
+
+  createDiv(parent: HTMLElement) {
+    this.maindiv = newDiv(parent, 'vertical-scroll bp-view');
+    this.render();
+    return this.maindiv[0];
+  }
+
+  refresh(moveCursor: boolean) {
+    this.render();
+  }
+
+  private render() {
+    const div = this.maindiv.empty();
+    const resolved = resolveBreakpoints();
+
+    // add/edit form
+    const editing = this.editingId != null ? resolved.find(r => r.bp.id == this.editingId) : null;
+    const form = $('<div class="bp-form"/>');
+    const targetInput = $('<input type="text" class="bp-input" spellcheck="false"/>')
+      .attr('placeholder', 'address or symbol (e.g. $8000, mainloop)')
+      .val(editing && editing.bp.type == 'address' ? editing.bp.target : '');
+    const condInput = $('<input type="text" class="bp-input" spellcheck="false"/>')
+      .attr('placeholder', 'condition (e.g. A>=$20, #scanline==222)')
+      .val(editing ? editing.bp.condition || '' : '');
+    const submit = $('<button class="btn btn-default btn-xs bp-submit"/>').text(editing ? 'Save' : 'Add');
+    const cancel = $('<button class="btn btn-default btn-xs bp-submit"/>').text('Cancel');
+    cancel.toggle(editing != null);
+    cancel.click(() => { this.editingId = null; this.render(); });
+    const doSubmit = () => {
+      const target = String(targetInput.val() || '').trim();
+      const cond = String(condInput.val() || '').trim() || undefined;
+      if (editing) {
+        if (editing.bp.type == 'address') bpStore.update(editing.bp.id, { target, condition: cond });
+        else bpStore.update(editing.bp.id, { condition: cond });
+        this.editingId = null;
+      } else if (target) {
+        bpStore.addAddressBreakpoint(target, cond);
+        targetInput.val('');
+        condInput.val('');
+      }
+      this.render();
+    };
+    submit.click(doSubmit);
+    form.append(targetInput, condInput, submit, cancel);
+    form.on('keydown', (e) => {
+      if (e.key == 'Enter') { e.preventDefault(); doSubmit(); }
+      if (e.key == 'Escape') { this.editingId = null; this.render(); }
+    });
+    div.append(form);
+
+    // breakpoint rows
+    for (const r of resolved) {
+      div.append(this.renderRow(r));
+    }
+    if (resolved.length == 0) {
+      div.append($('<div class="bp-hint"/>')
+        .text('No breakpoints. Click a line in the editor gutter (left of the line numbers), or add an address or symbol above.'));
+    }
+  }
+
+  private renderRow(r: ResolvedBreakpoint) {
+    const bp = r.bp;
+    const row = $('<div class="bp-row"/>');
+
+    // is the CPU currently stopped exactly at this breakpoint's address?
+    const c = lastDebugState && lastDebugState.c;
+    const stoppedPC = c ? (c.EPC != null ? c.EPC : c.PC) : undefined;
+    if (r.pc != null && stoppedPC === r.pc) row.addClass('bp-current');
+
+    const chk = $('<input type="checkbox" class="bp-chk"/>')
+      .prop('checked', bp.enabled)
+      .attr('title', bp.enabled ? 'Disable breakpoint' : 'Enable breakpoint')
+      .on('click', (e) => { e.stopPropagation(); bpStore.setEnabled(bp.id, !bp.enabled); });
+    row.append(chk);
+
+    // location: click to jump to the source line (or disassembly, if unresolved)
+    let loc: string;
+    if (bp.type == 'source') {
+      loc = getFilenameForPath(bp.file) + ':' + bp.line;
+    } else {
+      loc = bp.target;
+    }
+    const locSpan = $('<span class="bp-loc"/>').text(loc);
+    if (bp.type == 'source') {
+      locSpan.attr('title', bp.file + ':' + bp.line + ' (click to open)');
+      locSpan.on('click', () => {
+        const wnd = projectWindows.createOrShow(bp.file) as SourceEditor;
+        if (wnd && wnd.highlightLines) {
+          wnd.highlightLines(bp.line - 1, bp.line - 1);
+        }
+      });
+    } else if (r.pc != null) {
+      locSpan.attr('title', loc + ' ($' + hex(r.pc, 4) + ', click to open)');
+      locSpan.on('click', () => openLocationForPC(r.pc));
+    }
+    row.append(locSpan);
+
+    // resolved address or error
+    const addrSpan = $('<span class="bp-addr"/>');
+    if (r.pc != null) {
+      addrSpan.text('$' + hex(r.pc, 4));
+    } else {
+      addrSpan.text(r.error || '?').addClass('bp-error').attr('title', r.error);
+    }
+    row.append(addrSpan);
+
+    const condSpan = $('<span class="bp-cond"/>')
+      .text(bp.condition ? 'if ' + bp.condition : '')
+      .attr('title', bp.condition ? 'if ' + bp.condition : '');
+    row.append(condSpan);
+
+    const editBtn = $('<button class="bp-btn"><span class="glyphicon glyphicon-pencil"/></button>')
+      .attr('title', 'Edit breakpoint')
+      .on('click', () => { this.editingId = bp.id; this.render(); });
+    const delBtn = $('<button class="bp-btn"><span class="glyphicon glyphicon-trash"/></button>')
+      .attr('title', 'Delete breakpoint')
+      .on('click', () => bpStore.remove(bp.id));
+    row.append(editBtn, delBtn);
+
+    if (!bp.enabled) row.addClass('bp-disabled');
+    return row;
+  }
+}

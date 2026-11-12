@@ -1,0 +1,837 @@
+"use strict";
+// buildpresets - build every example the IDE offers through the CLI's own
+// compile path (src/tools/testlib), and report what does and doesn't build.
+// FOR TESTING ONLY
+//
+// The list comes from the platforms themselves: each platform module is
+// loaded headlessly and asked for getPresets(), the same list the IDE puts in
+// its Examples menu, plus the skeleton.<tool> templates it offers for a new
+// file. Files that happen to sit under presets/ but that no platform lists
+// (headers, libraries, editor scratch) are not built.
+//
+//   npm run buildpresets                     # everything
+//   npm run buildpresets -- --platform vcs   # one platform
+//   npm run buildpresets -- --filter sprite  # paths matching a substring
+//   npm run buildpresets -- --json out.json  # machine-readable report
+//   npm run buildpresets -- --baseline test/presets-baseline.json
+//   npm run buildpresets -- --verbose        # let the tools print as they run
+//   npm run buildpresets -- --no-strict      # allow builds with compiler warnings
+//   npm run buildpresets -- --run            # run each build for 300 frames
+//   npm run buildpresets -- --run --png dir  # ... and save a screenshot each
+//
+// With --run each preset that builds is loaded into its platform headlessly,
+// advanced for --frames frames (default 300), and its screen checked for
+// obvious trouble -- a blank or single-color frame, which usually means the
+// program never got going. --png writes a screenshot for each one.
+//
+// Tool output is hidden unless the build it belongs to fails, and a tool that
+// exits, aborts, or wedges fails just its own preset (see --timeout, ms).
+//
+// It also warns when a platform's examples are built with a tool but it has
+// no skeleton for it, which drops that tool from the IDE's new-file menu.
+//
+// With --baseline it exits nonzero when a preset that used to build stops
+// building (or a known-broken one starts building), so it can gate a commit.
+// A preset with compiler warnings fails unless --no-strict is given.
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+var __rest = (this && this.__rest) || function (s, e) {
+    var t = {};
+    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
+        t[p] = s[p];
+    if (s != null && typeof Object.getOwnPropertySymbols === "function")
+        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {
+            if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))
+                t[p[i]] = s[p[i]];
+        }
+    return t;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.toolsBySkeletonName = toolsBySkeletonName;
+exports.skeletonBuildName = skeletonBuildName;
+exports.libraryCollisions = libraryCollisions;
+exports.listPresets = listPresets;
+exports.screenStats = screenStats;
+exports.runPreset = runPreset;
+exports.buildPreset = buildPreset;
+exports.buildAllPresets = buildAllPresets;
+exports.compareToBaseline = compareToBaseline;
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+const util = __importStar(require("util"));
+const testlib_1 = require("./testlib");
+const emutarget_1 = require("./emutarget");
+const emu_1 = require("../common/emu");
+const toolmeta_1 = require("../common/toolmeta");
+const util_1 = require("../common/util");
+const platforms_1 = require("../worker/platforms");
+const cliformat_1 = require("./cliformat");
+const PRESETS_DIR = 'presets';
+const PLATFORM_SRC_DIR = 'src/platform';
+const DEFAULT_TIMEOUT = 120000;
+const DEFAULT_RUN_FRAMES = 200;
+// A frame this uniform after a few seconds almost always means nothing drew;
+// a real screen has a background plus text or sprites (or stars).
+const SOLID_FRACTION = 0.9995;
+// skip these platforms, they aren't ready yet or otherwise broken
+const SKIP_PLATFORMS = [
+    'vector-ataribw',
+    'williams-defender',
+    'astrocade-arcade',
+    'mcr',
+    'vectrex',
+    'devel',
+    'devel-6502',
+];
+// build these, but don't run them: the emulator needs a real browser
+// (x86 is the v86 PC emulator, loaded as a page script)
+const NO_RUN_PLATFORMS = ['x86'];
+// Load every platform module so it registers itself in PLATFORMS. A couple of
+// them touch the DOM at import time and can't run here; they're reported
+// rather than hidden.
+let platformsLoaded = false;
+async function importAllPlatforms(warn) {
+    if (platformsLoaded)
+        return;
+    platformsLoaded = true;
+    acquireRejectionGuard();
+    // listeners that exist before any platform module loads are the ones to keep
+    const keep = (0, emutarget_1.captureRejectionListeners)();
+    (0, emutarget_1.installNodeMocks)();
+    for (const entry of fs.readdirSync(PLATFORM_SRC_DIR).sort()) {
+        if (!entry.endsWith('.ts') || entry.startsWith('_'))
+            continue;
+        try {
+            await Promise.resolve(`${'../platform/' + entry.replace(/\.ts$/, '')}`).then(s => __importStar(require(s)));
+        }
+        catch (e) {
+            warn(`platform module ${entry}: ${e}`);
+        }
+    }
+    (0, emutarget_1.dropAbortHandlers)(keep);
+}
+// Which tool builds a preset: the same table the IDE's platform objects use
+// (src/common/toolselect.ts).
+function toolForPreset(relpath, platform) {
+    const tool = (0, testlib_1.getToolForFilename)(path.basename(relpath), platform);
+    // remote: tools need a build server, so they can't be checked offline
+    if (!tool || tool.startsWith('remote:') || !testlib_1.TOOLS[tool])
+        return null;
+    return tool;
+}
+// skeleton.<name> -> the tool that template belongs to. The name is usually
+// the tool id, but a tool can override it (getSkeletonName).
+function toolsBySkeletonName() {
+    const map = {};
+    for (const tool of Object.keys(testlib_1.TOOLS)) {
+        const name = (0, toolmeta_1.getSkeletonName)(tool);
+        // a local tool wins over the remote spelling of the same one
+        if (!map[name] || tool.indexOf('remote:') !== 0)
+            map[name] = tool;
+    }
+    return map;
+}
+// The IDE loads a skeleton into a file the user names, so it has to be built
+// under a name the tool will accept -- cmoc, for one, refuses skeleton.cmoc.
+function skeletonBuildName(tool, skelname) {
+    const meta = (0, toolmeta_1.getToolMeta)(tool);
+    const ext = meta && meta.extensions && meta.extensions[0];
+    return 'skeleton' + (ext || '.' + skelname);
+}
+// The new-file templates a platform offers, which the IDE finds the same way:
+// by looking for presets/<base platform>/skeleton.<tool>.
+function listSkeletons(dir, platform, skelTools) {
+    const found = [];
+    let entries;
+    try {
+        entries = fs.readdirSync(path.join(PRESETS_DIR, dir)).sort();
+    }
+    catch (e) {
+        return found;
+    }
+    for (const entry of entries) {
+        if (entry.indexOf('skeleton.') !== 0 || entry.endsWith('~'))
+            continue;
+        const skelname = entry.substring('skeleton.'.length);
+        const tool = skelTools[skelname];
+        // skeleton.llvm-mos and friends name a tool that only exists remotely
+        if (!tool || tool.indexOf('remote:') === 0)
+            continue;
+        found.push({
+            preset: dir + '/' + entry, platform, tool,
+            buildAs: skeletonBuildName(tool, skelname),
+        });
+    }
+    return found;
+}
+// Every preset any platform offers, in a stable order. Platform variants
+// (.mame, .wasm, -defender) repeat their parent's list, so the same file can
+// be named several times; it is built once, under the first platform that
+// claims it.
+/**
+ * Preset files that shadow a platform library file: the worker stages
+ * `extra_compile_files` from src/worker/lib/<platform>, so a same-named file in
+ * presets/<base platform> would be copied into new projects and win over it.
+ * Library files go in src/worker/lib only (doc/notes/sysroot.md, Tiers).
+ */
+function libraryCollisions(presetsDir, params) {
+    const found = new Set();
+    for (const id of Object.keys(params).sort()) {
+        for (const file of params[id].extra_compile_files || []) {
+            const relpath = (0, util_1.getBasePlatform)(id) + '/' + file;
+            if (fs.existsSync(path.join(presetsDir, relpath)))
+                found.add(`${presetsDir}/${relpath} shadows library file src/worker/lib/${relpath}`);
+        }
+    }
+    return [...found];
+}
+async function listPresets(filter, platform, warn = () => { }, err = () => { }) {
+    await importAllPlatforms(warn);
+    const found = [];
+    const seen = new Set();
+    const skelTools = toolsBySkeletonName();
+    // a platform whose preset folder isn't in this tree; reported in one line
+    const missing = {};
+    // platform variants share a preset folder, so their skeleton gaps are the
+    // same; report each dir+tool pair once
+    const noSkeleton = new Set();
+    const keep = (e) => {
+        if (seen.has(e.preset))
+            return;
+        seen.add(e.preset);
+        if (platform && e.platform !== platform)
+            return;
+        if (filter && e.preset.indexOf(filter) < 0)
+            return;
+        found.push(e);
+    };
+    for (const id of Object.keys(emu_1.PLATFORMS).sort()) {
+        if (SKIP_PLATFORMS.includes(id))
+            continue;
+        let presets;
+        let plat;
+        try {
+            plat = new emu_1.PLATFORMS[id](null);
+            presets = plat.getPresets ? plat.getPresets() : [];
+            if (presets.length === 0) {
+                warn(`platform ${id}: no presets listed in getPresets()`);
+            }
+        }
+        catch (e) {
+            warn(`platform ${id}: ${e}`);
+            continue;
+        }
+        // presets are served from presets/<base platform>/, as the IDE's
+        // WebPresetsFileSystem does it
+        const dir = (0, util_1.getBasePlatform)(id);
+        const presetTools = new Set();
+        for (const preset of presets || []) {
+            if (!preset || !preset.id)
+                continue;
+            const relpath = dir + '/' + preset.id;
+            if (!seen.has(relpath) && !fs.existsSync(path.join(PRESETS_DIR, relpath))) {
+                missing[id] = (missing[id] || 0) + 1;
+                seen.add(relpath);
+                warn(`platform ${id}: ${relpath} not found`);
+                continue;
+            }
+            const tool = toolForPreset(relpath, id);
+            if (!tool)
+                continue;
+            presetTools.add(tool);
+            keep({ preset: relpath, platform: id, tool });
+        }
+        const skeletons = listSkeletons(dir, id, skelTools);
+        for (const skel of skeletons)
+            keep(skel);
+        // a platform whose examples are built with a tool but that ships no
+        // skeleton.<tool> can't offer that tool in the IDE's new-file menu
+        const have = new Set(skeletons.map((s) => s.tool));
+        for (const tool of presetTools) {
+            if (have.has(tool))
+                continue;
+            const key = dir + '/' + tool;
+            if (noSkeleton.has(key))
+                continue;
+            noSkeleton.add(key);
+            warn(`platform ${id}: no skeleton for tool ${tool} ` +
+                `(${PRESETS_DIR}/${dir}/skeleton.${(0, toolmeta_1.getSkeletonName)(tool)})`);
+        }
+    }
+    for (const id of Object.keys(missing).sort()) {
+        err(`platform ${id}: ${missing[id]} preset(s) not in presets/${(0, util_1.getBasePlatform)(id)}/`);
+    }
+    for (const e of libraryCollisions(PRESETS_DIR, platforms_1.PLATFORM_PARAMS))
+        err(e);
+    found.sort((a, b) => a.preset < b.preset ? -1 : a.preset > b.preset ? 1 : 0);
+    return found;
+}
+function outputSize(result) {
+    const out = result.output;
+    if (!out)
+        return undefined;
+    if (out.length != null)
+        return out.length;
+    if (out.code && out.code.length != null)
+        return out.code.length;
+    return undefined;
+}
+// tools like ca65/cc65 need their support filesystem loaded first, the same
+// way `8bws build` does it
+const preloaded = new Set();
+async function preloadOnce(tool, platform) {
+    const key = tool + '/' + platform;
+    if (preloaded.has(key))
+        return;
+    preloaded.add(key);
+    try {
+        await (0, testlib_1.preload)(tool, platform);
+    }
+    catch (e) {
+        // a tool with no filesystem to preload is fine
+    }
+}
+// --- surviving a tool that misbehaves --------------------------------------
+// Several of the Emscripten-built tools answer a fatal error by ending the
+// host process (cmoc does it when it dislikes a filename), which would stop
+// the sweep partway through with no report. Trap exit/abort and turn them
+// into a failure of whatever preset is being built at the time.
+class ProcessExitError extends Error {
+}
+let exitTrap = null;
+let guardRefs = 0;
+let restoreGuard = null;
+function installExitGuard() {
+    const proc = process; // reallyExit is undeclared but real
+    const real = {
+        exit: proc.exit,
+        reallyExit: proc.reallyExit,
+        abort: proc.abort,
+    };
+    const trap = (call) => {
+        const err = new ProcessExitError(`tool called ${call}`);
+        // fail the build in flight, then unwind the tool itself
+        if (exitTrap)
+            exitTrap(err);
+        throw err;
+    };
+    proc.exit = (code) => trap(`process.exit(${code != null ? code : ''})`);
+    proc.reallyExit = (code) => trap(`process.reallyExit(${code != null ? code : ''})`);
+    proc.abort = () => trap('process.abort()');
+    return () => {
+        proc.exit = real.exit;
+        proc.reallyExit = real.reallyExit;
+        proc.abort = real.abort;
+    };
+}
+function acquireExitGuard() {
+    if (guardRefs++ === 0)
+        restoreGuard = installExitGuard();
+}
+function releaseExitGuard() {
+    if (--guardRefs === 0 && restoreGuard) {
+        restoreGuard();
+        restoreGuard = null;
+    }
+}
+const strayErrors = [];
+let rejectGuard = null;
+function acquireRejectionGuard() {
+    if (rejectGuard)
+        return;
+    const handler = (reason) => {
+        strayErrors.push({
+            message: '' + ((reason && reason.message) || reason),
+            stack: reason && reason.stack,
+        });
+    };
+    process.on('unhandledRejection', handler);
+    rejectGuard = () => { process.off('unhandledRejection', handler); rejectGuard = null; };
+}
+// Tools chatter on stdout/stderr while they run -- banners, warnings, the
+// occasional fatal error. Buffer it all and only show the part that belongs
+// to a build that failed.
+function captureOutput() {
+    const chunks = [];
+    let truncated = false;
+    const push = (s) => {
+        if (chunks.length < 1000)
+            chunks.push(s);
+        else
+            truncated = true;
+    };
+    const realWrite = { stdout: process.stdout.write, stderr: process.stderr.write };
+    const realConsole = {};
+    const hook = (stream) => {
+        stream.write = ((chunk, enc, cb) => {
+            push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+            const done = typeof enc === 'function' ? enc : cb;
+            if (typeof done === 'function')
+                done();
+            return true;
+        });
+    };
+    hook(process.stdout);
+    hook(process.stderr);
+    // a tool may have grabbed its own reference to console.log at load time
+    for (const name of ['log', 'error', 'warn', 'info', 'debug', 'trace']) {
+        realConsole[name] = console[name];
+        console[name] = (...args) => push(util.format(...args) + '\n');
+    }
+    return {
+        stop() {
+            process.stdout.write = realWrite.stdout;
+            process.stderr.write = realWrite.stderr;
+            for (const name of Object.keys(realConsole))
+                console[name] = realConsole[name];
+            const text = chunks.join('').replace(/\s+$/, '');
+            return truncated ? text + '\n...output truncated...' : text;
+        }
+    };
+}
+// A build step can reach for a second tool -- a project that links sources of
+// more than one kind -- whose filesystem nobody preloaded. Load it and retry.
+const RE_NO_FS = /No filesystem for '([^']+)'/;
+// --- running a built preset ------------------------------------------------
+// Reject when a platform's start() wedges, so one stuck emulator can't hold up
+// the whole sweep. The underlying promise is abandoned, not cancelled.
+function withTimeout(p, ms, what) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+        p.then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); reject(e); });
+    });
+}
+// Some platforms pick a load format from the title's extension (an Atari XEX
+// named .rom would load as a cartridge), the same as `8bws run`.
+function romTitle(preset, rom, target) {
+    const base = path.basename(preset);
+    const ext = target.platform.getROMExtension && target.platform.getROMExtension(rom);
+    return ext ? base.replace(/\.[^.]*$/, '') + ext : base;
+}
+// Count the colors on the last frame. A single color -- or a frame nobody ever
+// touched -- is the cheapest sign that a program didn't get going. Pure, so it
+// can be checked without an emulator.
+function screenStats(pixels, width = 0, height = 0) {
+    const counts = new Map();
+    let top = 0, topColor = 0;
+    for (let i = 0; i < pixels.length; i++) {
+        const color = pixels[i];
+        const n = (counts.get(color) || 0) + 1;
+        counts.set(color, n);
+        if (n > top) {
+            top = n;
+            topColor = color;
+        }
+    }
+    const dominant = top / (pixels.length || 1);
+    let verdict;
+    if (counts.size <= 1) {
+        // transparent black is the untouched headless buffer, not a drawn frame
+        verdict = (topColor >>> 24) === 0 ? 'blank' : 'solid';
+    }
+    else {
+        verdict = dominant >= SOLID_FRACTION ? 'solid' : 'ok';
+    }
+    return { width, height, colors: counts.size, dominant, color: topColor, verdict };
+}
+function analyzeVideo(video, run) {
+    Object.assign(run, screenStats(video.pixels, video.width, video.height));
+}
+async function writePresetPNG(video, preset, dir) {
+    const { encode } = await Promise.resolve().then(() => __importStar(require('fast-png')));
+    const { pixels, width, height } = video;
+    const png = encode({
+        width, height,
+        data: new Uint8Array(pixels.buffer, pixels.byteOffset, width * height * 4),
+        channels: 4,
+    });
+    // flatten the preset path so presets/<platform>/foo.c and a sibling
+    // foo.s never collide in the output directory
+    const file = path.join(dir, preset.replace(/[\\/]/g, '_') + '.png');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, png);
+    return file;
+}
+/** Load a finished build into its platform and advance it a while. */
+async function runPreset(result, preset, platform, opts = {}) {
+    const started = Date.now();
+    const frames = opts.frames || DEFAULT_RUN_FRAMES;
+    const run = { ok: false, frames, verdict: 'error', ms: 0 };
+    if (NO_RUN_PLATFORMS.includes(platform)) {
+        return Object.assign(Object.assign({}, run), { ok: true, frames: 0, verdict: 'skipped' });
+    }
+    const capture = opts.verbose ? null : captureOutput();
+    let target = null;
+    try {
+        target = await (0, emutarget_1.loadPlatform)(platform);
+        await withTimeout(target.start(), opts.timeout || DEFAULT_TIMEOUT, 'platform start');
+        if (result.files)
+            target.setFileData(result.files);
+        const rom = (0, testlib_1.romBytes)(result);
+        if (rom)
+            await target.loadROM(rom, romTitle(preset, rom, target));
+        else
+            await target.loadROM(result.output, path.basename(preset));
+        for (let i = 0; i < frames; i++)
+            target.advanceFrame();
+        run.ok = true;
+        let video = target.getVideo();
+        if (!video) {
+            for (let i = 0; i < frames; i++)
+                target.advanceFrame();
+            video = target.getVideo();
+        }
+        if (!video) {
+            run.verdict = 'novideo';
+        }
+        else {
+            analyzeVideo(video, run);
+            if (opts.pngDir)
+                run.png = await writePresetPNG(video, preset, opts.pngDir);
+        }
+    }
+    catch (e) {
+        if (e instanceof emu_1.EmuHalt && e.normal) {
+            // the program stopped by design (arm32 semihost exit); the emulator
+            // did its job, so that's a clean halt. Other EmuHalts (HLT opcode,
+            // watchdog, illegal instruction) are still failures.
+            run.ok = true;
+            run.verdict = 'halted';
+            run.error = '' + (e.message || e);
+        }
+        else {
+            run.ok = false;
+            run.verdict = 'error';
+            run.error = '' + (e && e.message ? e.message : e);
+        }
+    }
+    // report what actually ran, which is less than requested if it threw
+    if (target)
+        run.frames = target.frameCount;
+    if (capture)
+        run.log = capture.stop() || undefined;
+    run.ms = Date.now() - started;
+    return run;
+}
+// A preset path is relative to the presets dir, unless it is absolute -- the
+// compatibility sweep builds files that live in another tree.
+function presetFile(presetsDir, preset) {
+    return path.isAbsolute(preset) ? preset : path.join(presetsDir, preset);
+}
+async function buildPreset(preset, platform, tool, opts = {}) {
+    const started = Date.now();
+    const timeout = opts.timeout || DEFAULT_TIMEOUT;
+    let result = null;
+    let thrown = null;
+    let errors = [];
+    let log = '';
+    for (let attempt = 0;; attempt++) {
+        const capture = opts.verbose ? null : captureOutput();
+        let timer = null;
+        result = null;
+        thrown = null;
+        acquireExitGuard();
+        try {
+            // a tool that exits, or one that wedges, loses the race and fails
+            // this preset instead of ending the sweep
+            const exited = new Promise((_, reject) => { exitTrap = reject; });
+            const expired = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`timed out after ${timeout}ms`)), timeout);
+            });
+            await preloadOnce(tool, platform);
+            result = await Promise.race([
+                (0, testlib_1.compileSourceFile)(tool, platform, presetFile(opts.presetsDir || PRESETS_DIR, preset), opts.buildAs),
+                exited,
+                expired,
+            ]);
+        }
+        catch (e) {
+            thrown = e;
+        }
+        finally {
+            exitTrap = null;
+            if (timer)
+                clearTimeout(timer);
+            releaseExitGuard();
+            if (capture)
+                log = capture.stop();
+        }
+        if (thrown) {
+            errors = ["" + (thrown && thrown.message ? thrown.message : thrown)];
+        }
+        else if (!result.success) {
+            errors = (result.errors || []).map((e) => `${e.severity === 'warning' ? 'warning: ' : ''}${e.path || preset}:${e.line} ${e.msg}`);
+            if (!errors.length)
+                errors = ['build failed'];
+        }
+        else {
+            errors = [];
+        }
+        const needsFS = attempt === 0 && RE_NO_FS.exec(errors.join('\n'));
+        if (!needsFS)
+            break;
+        await preloadOnce(needsFS[1], platform);
+    }
+    const warnings = ((result === null || result === void 0 ? void 0 : result.warnings) || []).map((w) => `${w.path || preset}:${w.line} ${w.msg}`);
+    let strictFailure = false;
+    if (opts.strict && !errors.length && warnings.length) {
+        errors = warnings.map((w) => 'warning: ' + w);
+        strictFailure = true;
+    }
+    const ms = Date.now() - started;
+    const internal = (result === null || result === void 0 ? void 0 : result.internal) ? `${result.internal.tool}: ${result.internal.msg}` : undefined;
+    if (errors.length)
+        return { preset, platform, tool, ok: false, ms, errors, warnings: warnings.length ? warnings : undefined, internal, log: strictFailure ? undefined : log || undefined };
+    const built = { preset, platform, tool, ok: true, size: outputSize(result), ms };
+    if (warnings.length)
+        built.warnings = warnings;
+    if (opts.run)
+        built.run = await runPreset(result, preset, platform, opts);
+    return built;
+}
+async function buildAllPresets(opts = {}) {
+    const results = [];
+    const todo = opts.presets || await listPresets(opts.filter, opts.platform);
+    // tools install their own handlers on every run; don't let node warn about it
+    process.setMaxListeners(0);
+    // hold the guard across the whole sweep, so an exit that arrives between
+    // two builds can't slip through either
+    acquireExitGuard();
+    try {
+        for (const { preset, platform, tool, buildAs } of todo) {
+            const r = await buildPreset(preset, platform, tool, Object.assign(Object.assign({}, opts), { buildAs }));
+            results.push(r);
+            if (opts.onResult)
+                opts.onResult(r);
+        }
+    }
+    finally {
+        releaseExitGuard();
+    }
+    return results;
+}
+// --- command line ---------------------------------------------------------
+// ANSI only when a terminal is reading; piping to a file or a CI log gets
+// plain text, and NO_COLOR turns it off everywhere.
+const useColor = !!process.stdout.isTTY && !process.env.NO_COLOR;
+const paint = (code) => (s) => useColor ? `${code}${s}${cliformat_1.c.reset}` : `${s}`;
+const bold = paint(cliformat_1.c.bold), dim = paint(cliformat_1.c.dim);
+const green = paint(cliformat_1.c.green), red = paint(cliformat_1.c.red), yellow = paint(cliformat_1.c.yellow), cyan = paint(cliformat_1.c.cyan);
+function arg(argv, name) {
+    const i = argv.indexOf('--' + name);
+    return i >= 0 ? argv[i + 1] : undefined;
+}
+/** One short phrase describing what running a preset produced. */
+function runStatus(run) {
+    var _a;
+    const info = run.error
+        ? run.error
+        : `${run.colors} color${run.colors === 1 ? '' : 's'}, ${(100 * ((_a = run.dominant) !== null && _a !== void 0 ? _a : 1)).toFixed(1)}%` +
+            (run.color != null ? ` #${(run.color >>> 0).toString(16).padStart(8, '0')}` : '');
+    switch (run.verdict) {
+        case 'ok': return green('run ok') + ' ' + dim(info);
+        case 'halted': return dim('run halted') + ' ' + dim(info);
+        case 'novideo': return dim('run: no video');
+        case 'skipped': return dim('run: skipped (needs browser)');
+        case 'blank': return yellow(bold('run BLANK')) + ' ' + dim(info);
+        case 'solid': return yellow(bold('run SOLID')) + ' ' + dim(info);
+        default: return red(bold('run FAIL')) + ' ' + dim(info);
+    }
+}
+function compareToBaseline(results, baselinePath) {
+    const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
+    const was = {};
+    const wasWarnings = {};
+    for (const b of baseline) {
+        was[b.preset] = b.ok;
+        wasWarnings[b.preset] = b.warnings ? b.warnings.length : 0;
+    }
+    let broke = 0, fixed = 0, added = 0, warned = 0;
+    for (const r of results) {
+        if (!(r.preset in was)) {
+            console.log(`  ${yellow('NEW')}      ${r.preset} (${r.ok ? 'builds' : 'fails'})`);
+            added++;
+        }
+        else if (was[r.preset] && !r.ok) {
+            console.log(`  ${red(bold('BROKE'))}    ${r.preset}`);
+            for (const e of r.errors || [])
+                console.log(`             ${red(e)}`);
+            broke++;
+        }
+        else if (!was[r.preset] && r.ok) {
+            console.log(`  ${green('FIXED')}    ${r.preset}`);
+            fixed++;
+        }
+        // a build that still works but warns more than it used to
+        const nwarn = r.warnings ? r.warnings.length : 0;
+        if (r.preset in was && nwarn > wasWarnings[r.preset]) {
+            console.log(`  ${yellow('WARNINGS')} ${r.preset} (${wasWarnings[r.preset]} -> ${nwarn})`);
+            for (const w of r.warnings || [])
+                console.log(`             ${yellow(w)}`);
+            warned++;
+        }
+    }
+    const seen = new Set(results.map((r) => r.preset));
+    for (const b of baseline) {
+        if (!seen.has(b.preset))
+            console.log(`  ${dim('MISSING')}  ${dim(b.preset)}`);
+    }
+    console.log(`\nvs baseline: ${broke ? red(broke + ' broke') : '0 broke'}, ` +
+        `${fixed ? green(fixed + ' fixed') : '0 fixed'}, ${added} new` +
+        (warned ? `, ${yellow(warned + ' with more warnings')}` : ''));
+    return broke;
+}
+async function main() {
+    const argv = process.argv.slice(2);
+    const filter = arg(argv, 'filter');
+    const platform = arg(argv, 'platform');
+    const jsonFile = arg(argv, 'json');
+    const baseline = arg(argv, 'baseline');
+    const quiet = argv.includes('--quiet');
+    const verbose = argv.includes('--verbose');
+    const strict = !argv.includes('--no-strict');
+    // asking for frames or a screenshot only makes sense while running
+    const run = argv.includes('--run') || argv.includes('--frames') || argv.includes('--png');
+    const frames = arg(argv, 'frames') ? parseInt(arg(argv, 'frames')) : undefined;
+    const pngDir = arg(argv, 'png');
+    const timeout = arg(argv, 'timeout') ? parseInt(arg(argv, 'timeout')) : undefined;
+    // collect stray async rejections so a misbehaving platform can't abort the sweep
+    acquireRejectionGuard();
+    const warnings = [];
+    const errors = [];
+    const presets = await listPresets(filter, platform, (w) => warnings.push(w), (e) => errors.push(e));
+    for (const w of warnings)
+        console.log(dim(`note: ${w}`));
+    for (const e of errors)
+        console.log(red(`error: ${e}`));
+    if (errors.length) {
+        console.error(red(`aborting: ${errors.length} problem(s) with the presets tree`));
+    }
+    console.log(bold(`${run ? 'building and running' : 'building'} ${presets.length} presets...`));
+    const results = await buildAllPresets({
+        presets, timeout, verbose, strict, run, frames, pngDir, onResult: (r) => {
+            var _a, _b;
+            const clean = !r.run || r.run.verdict === 'ok' || r.run.verdict === 'novideo' || r.run.verdict === 'skipped' || r.run.verdict === 'halted';
+            if (quiet && r.ok && clean && !r.warnings)
+                return;
+            const status = r.ok ? green('ok  ') : red(bold('FAIL'));
+            const size = r.size != null ? `${r.size} bytes` : '';
+            const runText = r.run ? ' ' + runStatus(r.run) : '';
+            console.log(`${status} ${r.preset} ${cyan(`[${r.tool}/${r.platform}]`)} ${dim(size)} ${dim(r.ms + 'ms')}${runText}`);
+            for (const e of r.errors || [])
+                console.log(`       ${yellow(e)}`);
+            // when strict the warnings are the errors, already listed
+            if (r.ok)
+                for (const w of r.warnings || [])
+                    console.log(`       ${dim('warning: ' + w)}`);
+            if (r.internal)
+                console.log(`       ${red(bold('CRASH'))} ${red(r.internal)} ${dim('(the IDE would report this)')}`);
+            if ((_a = r.run) === null || _a === void 0 ? void 0 : _a.png)
+                console.log(`       ${dim(r.run.png)}`);
+            // only a failure gets the tool's / platform's own output
+            if (r.log)
+                console.log(dim(r.log.split('\n').map((l) => '     | ' + l).join('\n')));
+            if (((_b = r.run) === null || _b === void 0 ? void 0 : _b.log) && r.run.verdict === 'error') {
+                console.log(dim(r.run.log.split('\n').map((l) => '     | ' + l).join('\n')));
+            }
+        }
+    });
+    const failed = results.filter((r) => !r.ok);
+    const built = results.length - failed.length;
+    const tally = `${built}/${results.length} presets build`;
+    console.log('\n' + bold(failed.length ? yellow(tally) : green(tally)));
+    if (failed.length) {
+        console.log('\n' + bold('failures:'));
+        const byTool = {};
+        for (const r of failed) {
+            byTool[r.tool] = (byTool[r.tool] || 0) + 1;
+            console.log(`  ${red(r.preset)} ${cyan(`[${r.tool}/${r.platform}]`)}`);
+        }
+        console.log('\nby tool: ' + Object.keys(byTool).sort()
+            .map((t) => `${cyan(t)}=${byTool[t]}`).join(' '));
+    }
+    const warned = results.filter((r) => r.ok && r.warnings);
+    if (warned.length) {
+        const nwarn = warned.reduce((n, r) => n + r.warnings.length, 0);
+        console.log('\n' + yellow(`${nwarn} warning(s) in ${warned.length} preset(s)`) + dim(' (allowed by --no-strict)'));
+    }
+    const crashed = results.filter((r) => r.internal);
+    if (crashed.length) {
+        console.log('\n' + bold(red(`${crashed.length} tool crash(es)`)) + dim(' -- would be sent as error reports:'));
+        for (const r of crashed)
+            console.log(`  ${red(r.preset)} ${cyan(`[${r.tool}/${r.platform}]`)} ${r.internal}`);
+    }
+    // what the builds did when loaded, separately from whether they built
+    const ran = results.filter((r) => r.run);
+    if (ran.length) {
+        const problems = ran.filter((r) => r.run.verdict !== 'ok' && r.run.verdict !== 'novideo' && r.run.verdict !== 'skipped' && r.run.verdict !== 'halted');
+        const tally2 = `${ran.length - problems.length}/${ran.length} presets run clean`;
+        console.log('\n' + bold(problems.length ? yellow(tally2) : green(tally2)));
+        if (problems.length) {
+            console.log('\n' + bold('run problems:'));
+            for (const r of problems) {
+                console.log(`  ${red(r.preset)} ${cyan(`[${r.tool}/${r.platform}]`)} ${runStatus(r.run)}`);
+            }
+        }
+    }
+    // stray async failures from platforms that never settled
+    if (strayErrors.length) {
+        console.log('\n' + bold(yellow(`${strayErrors.length} stray async error(s):`)));
+        for (const e of strayErrors) {
+            console.log('  ' + red(e.message));
+            if (verbose && e.stack)
+                console.log(dim(e.stack.split('\n').map((l) => '     ' + l).join('\n')));
+        }
+    }
+    if (jsonFile) {
+        // captured output is for reading on the console, not for diffing
+        // against a baseline
+        const report = results.map((_a) => {
+            var { log } = _a, r = __rest(_a, ["log"]);
+            return (Object.assign(Object.assign({}, r), { run: r.run ? Object.assign(Object.assign({}, r.run), { log: undefined }) : undefined }));
+        });
+        fs.writeFileSync(jsonFile, JSON.stringify(report, null, 1));
+        console.log(dim(`\nwrote ${jsonFile}`));
+    }
+    if (baseline) {
+        process.exit(compareToBaseline(results, baseline) ? 1 : 0);
+    }
+    if (errors.length) {
+        process.exit(1);
+    }
+}
+if (require.main === module) {
+    main().catch((e) => { console.error(e); process.exit(2); });
+}
+//# sourceMappingURL=buildpresets.js.map

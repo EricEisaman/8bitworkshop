@@ -1,0 +1,80 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.assembleZMAC = assembleZMAC;
+const builder_1 = require("../builder");
+const listingutils_1 = require("../listingutils");
+const listingutils_2 = require("../listingutils");
+const wasishim_1 = require("../../common/wasi/wasishim");
+const wasmutils_1 = require("../wasmutils");
+const wasiutils_1 = require("../wasiutils");
+let wasiModule = null;
+function assembleZMAC(step) {
+    let errors = [];
+    var params = step.params;
+    (0, builder_1.gatherFiles)(step, { mainFilePath: "main.asm" });
+    var lstpath = step.prefix + ".lst";
+    var binpath = step.prefix + ".cim";
+    if ((0, builder_1.staleFiles)(step, [binpath])) {
+        if (!wasiModule) {
+            wasiModule = new WebAssembly.Module((0, wasmutils_1.loadWASMBinary)("zmac"));
+        }
+        const wasi = new wasishim_1.WASIRunner();
+        wasi.initSync(wasiModule);
+        (0, wasiutils_1.populateWASIFiles)(wasi, step);
+        /*
+      error1.asm(4) : 'l18d4' Undeclared
+             JP      L18D4
+    
+      error1.asm(11): warning: 'foobar' treated as label (instruction typo?)
+          Add a colon or move to first column to stop this warning.
+      1 errors (see listing if no diagnostics appeared here)
+        */
+        const matcher = (0, listingutils_1.makeErrorMatcher)(errors, /([^( ]+)\s*[(](\d+)[)]\s*:\s*(.+)/, 2, 3, step.path);
+        // TODO: don't know why CIM (hexary) doesn't work
+        wasi.setArgs(['zmac', '-z', '-c', '--oo', 'lst,cim', step.path]);
+        (0, wasiutils_1.runWASI)(wasi, errors);
+        const stderr = wasi.fds[2].getBytesAsString();
+        for (let line of stderr.split(listingutils_2.re_crlf)) {
+            matcher(line);
+        }
+        if (errors.length) {
+            return { errors: errors };
+        }
+        let lstout, binout;
+        try {
+            lstout = wasi.fs.getFile("./zout/" + lstpath).getBytesAsString();
+            binout = wasi.fs.getFile("./zout/" + binpath).getBytes();
+        }
+        catch (e) {
+            errors.push({ line: 0, msg: "No output generated, maybe a fatal assembly error?" });
+            return { errors: errors };
+        }
+        (0, builder_1.putWorkFile)(binpath, binout);
+        (0, builder_1.putWorkFile)(lstpath, lstout);
+        if (!(0, builder_1.anyTargetChanged)(step, [binpath, lstpath]))
+            return;
+        //  230: 1739+7+x   017A  1600      L017A: LD      D,00h
+        var lines = (0, listingutils_1.parseListing)(lstout, /\s*(\d+):\s*([0-9a-f]+)\s+([0-9a-f]+)\s+(.+)/i, 1, 2, 3);
+        var listings = {};
+        listings[lstpath] = { lines: lines };
+        // parse symbol table
+        var symbolmap = {};
+        var sympos = lstout.indexOf('Symbol Table:');
+        if (sympos > 0) {
+            var symout = lstout.slice(sympos + 14);
+            symout.split('\n').forEach(function (l) {
+                var m = l.match(/(\S+)\s+([= ]*)([0-9a-f]+)/i);
+                if (m) {
+                    symbolmap[m[1]] = parseInt(m[3], 16);
+                }
+            });
+        }
+        return {
+            output: binout,
+            listings: listings,
+            errors: errors,
+            symbolmap: symbolmap
+        };
+    }
+}
+//# sourceMappingURL=z80.js.map

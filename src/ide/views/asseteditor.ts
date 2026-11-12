@@ -1,0 +1,545 @@
+
+import { DMG_PALETTE } from "../../common/gbpalette";
+import { hex, rgb2bgr, safeident } from "../../common/util";
+import { FileData } from "../../common/workertypes";
+import * as pixed from "../pixeleditor";
+import { current_project, platform_id, projectWindows } from "../ui";
+import { Shortcut } from "../shortcutbar";
+import { newDiv, ProjectView } from "./baseviews";
+
+// Lazy mousetrap require: mousetrap references `document` at module load time,
+// which crashes in Node-based tests (window is polyfilled, document is not).
+function getMousetrap() {
+    return require('mousetrap');
+}
+
+export class AssetEditorView implements ProjectView, pixed.EditorContext {
+  maindiv: JQuery;
+  cureditordiv: JQuery;
+  cureditelem: JQuery;
+  cureditnode: pixed.PixNode;
+  rootnodes: pixed.PixNode[];
+  deferrednodes: pixed.PixNode[];
+  createDiv(parent: HTMLElement) {
+    this.maindiv = newDiv(parent, "vertical-scroll");
+    // focusable so the shortcut bar can tell when this view has focus
+    // (default focus still applies to inner inputs, refining this)
+    var div = this.maindiv[0];
+    div.setAttribute('tabindex', '-1');
+    div.addEventListener('mousedown', () => { div.focus(); });
+    return div;
+  }
+
+  // chips for the global asset undo/redo (bound via mousetrap in setVisible)
+  getShortcuts(): Shortcut[] {
+    return [
+      { key: 'mod+z', label: 'Undo', fn: () => projectWindows.undoStep() },
+      { key: 'mod+shift+z', label: 'Redo', fn: () => projectWindows.redoStep() },
+    ];
+  }
+
+  clearAssets() {
+    this.rootnodes = [];
+    this.deferrednodes = [];
+  }
+
+  registerAsset(type: string, node: pixed.PixNode, deferred: number) {
+    this.rootnodes.push(node);
+    if (deferred) {
+      if (deferred > 1)
+        this.deferrednodes.push(node);
+      else
+        this.deferrednodes.unshift(node);
+    } else {
+      node.refreshRight();
+    }
+  }
+
+  getPalettes(matchlen: number): pixed.SelectablePalette[] {
+    var result = [];
+    var palnum = 0;
+    this.rootnodes.forEach((node) => {
+      while (node != null) {
+        if (node instanceof pixed.PaletteFormatToRGB) {
+          // TODO: move to node class?
+          var palette = node.palette;
+          // Auto-name by position so several unnamed palettes stay distinct;
+          // an explicit header `name` wins.
+          palnum++;
+          var palname = node.palfmt.name || ("Palette " + palnum);
+          // match full palette length?
+          if (matchlen == palette.length) {
+            result.push({ node: node, name: palname, palette: palette });
+          }
+          // look at palette slices
+          if (node.layout) {
+            result.push(...pixed.computePaletteSlices(palette, node.layout, matchlen, node, palname));
+          }
+          break;
+        }
+        node = node.right;
+      }
+    });
+    // Several palettes can share layout slice names ("Background 0" etc.);
+    // prefix just those duplicates with their owning palette's name.
+    pixed.disambiguatePaletteNames(result);
+    // Game Boy: default to LCD green scale (0=light … 3=dark) when no project palette
+    if (result.length == 0 && platform_id && platform_id.startsWith('gb')) {
+      if (matchlen == 4) {
+        result.push({ node: null, name: "DMG Green", palette: new Uint32Array(DMG_PALETTE) });
+      } else if (matchlen == 2) {
+        result.push({
+          node: null,
+          name: "DMG Green",
+          palette: new Uint32Array([DMG_PALETTE[0], DMG_PALETTE[3]]),
+        });
+      }
+    }
+    return result;
+  }
+
+  getTilemaps(matchlen: number): pixed.SelectableTilemap[] {
+    var result = [];
+    this.rootnodes.forEach((node) => {
+      while (node != null) {
+        if (node instanceof pixed.Palettizer) {
+          var rgbimgs = node.rgbimgs;
+          if (rgbimgs && rgbimgs.length >= matchlen) {
+            result.push({ node: node, name: "Tilemap", images: node.images, rgbimgs: rgbimgs }); // TODO
+          }
+        }
+        node = node.right;
+      }
+    });
+    return result;
+  }
+
+  isEditing() {
+    return this.cureditordiv != null;
+  }
+
+  getCurrentEditNode() {
+    return this.cureditnode;
+  }
+
+  setCurrentEditor(div: JQuery, editing: JQuery, node: pixed.PixNode) {
+    const timeout = 250;
+    if (this.cureditordiv != div) {
+      if (this.cureditordiv) {
+        this.cureditordiv.hide(timeout);
+        this.cureditordiv = null;
+      }
+      if (div) {
+        this.cureditordiv = div;
+        this.cureditordiv.show();
+        this.cureditordiv[0].scrollIntoView({ behavior: "smooth", block: "center" });
+        //setTimeout(() => { this.cureditordiv[0].scrollIntoView({behavior: "smooth", block: "center"}) }, timeout);
+      }
+    }
+    if (this.cureditelem) {
+      this.cureditelem.removeClass('selected');
+      this.cureditelem = null;
+    }
+    if (editing) {
+      this.cureditelem = editing;
+      this.cureditelem.addClass('selected');
+    }
+    while (node.left) {
+      node = node.left;
+    }
+    this.cureditnode = node;
+    this.updateHashForSelection(div);
+  }
+
+  updateHashForSelection(div: JQuery) {
+    if (typeof window === 'undefined') return;
+    var block = div ? div.closest('.asset_block[data-fileid]') : null;
+    var fileid = block && block.attr('data-fileid');
+    var startline = block && block.attr('data-startline');
+    var hash = '#asseteditor';
+    if (fileid && startline) {
+      hash += '/' + encodeURIComponent(fileid) + '/' + startline;
+    }
+    if (window.location.hash !== hash) {
+      history.replaceState(null, '', hash);
+    }
+  }
+
+  scanFileTextForAssets(id: string, data: string) {
+    // scan file for assets
+    // /*{json}*/ or ;;{json};;
+    // TODO: put before ident, look for = {
+    var frags = pixed.scanTextForAssetFragments(data, platform_id.includes('verilog'), id.endsWith('.rs'));
+    var result = frags.map((frag) => ({ fileid: id, ...frag }));
+    // look for DEF_METASPRITE_2x2(playerRStand, 0xd8, 0)
+    // TODO: this feature was never implemented, it would require a totally new type of editor and stuff
+    /*
+    var re2 = /DEF_METASPRITE_(\d+)x(\d+)[(](\w+),\s*(\w+),\s*(\w+)/gi;
+    while (m = re2.exec(data)) {
+      var width = parseInt(m[1]);
+      var height = parseInt(m[2]);
+      var ident = m[3];
+      var tile = parseInt(m[4]);
+      var attr = parseInt(m[5]);
+      var metadefs = [];
+      for (var x = 0; x < width; x++) {
+        for (var y = 0; y < height; y++) {
+          metadefs.push({ x: x * 8, y: y * 8, tile: tile, attr: attr });
+        }
+      }
+      var meta = { defs: metadefs, width: width * 8, height: height * 8 };
+      result.push({ fileid: id, label: ident, meta: meta });
+    }
+    */
+    // TODO: look for decode <ident> --- ... ---
+    /*
+    var re3 = /\bdecode\s+(\w+)\s*---(.+?)---/gims;
+    while (m = re3.exec(data)) {
+    }
+    */
+    return result;
+  }
+
+  // TODO: move to pixeleditor.ts?
+  addPaletteEditorViews(parentdiv: JQuery, pal2rgb: pixed.PaletteFormatToRGB, callback): () => void {
+    var adual = $('<div class="asset_dual"/>').appendTo(parentdiv);
+    var aeditor = $('<div class="asset_editor"/>').hide(); // contains editor, when selected
+    // Direct-color palettes (pal:444 etc.) have thousands of colors; the picker
+    // edits RGB directly instead of enumerating every swatch.
+    var directcolor = pixed.getDirectColorChannels(pal2rgb.palfmt);
+    var allrgbimgs = [];
+    if (!directcolor)
+      pal2rgb.getAllColors().forEach((rgba) => { allrgbimgs.push(new Uint32Array([rgba])); }); // array of array of 1 rgb color (for picker)
+    var atable = $('<table/>').appendTo(adual);
+    aeditor.appendTo(adual);
+    // make default layout if not exists
+    var layout = pal2rgb.layout;
+    if (!layout) {
+      var len = pal2rgb.palette.length;
+      var imgsperline = 8;
+      layout = [];
+      for (var i = 0; i < len; i += imgsperline) {
+        layout.push(["", i, Math.min(len - i, imgsperline)]);
+      }
+    }
+    var cells: { cell: JQuery, index: number }[] = [];
+    function updateCell(cell, j) {
+      var val = pal2rgb.words[j];
+      var rgb = pal2rgb.palette[j];
+      var hexcol = '#' + hex(rgb2bgr(rgb), 6);
+      var textcol = (rgb & 0x008000) ? 'black' : 'white';
+      cell.text(hex(val, 2)).css('background-color', hexcol).css('color', textcol);
+    }
+    function updateAllCells() {
+      cells.forEach(({ cell, index }) => updateCell(cell, index));
+    }
+    // iterate over each row of the layout
+    layout.forEach(([name, start, len]) => {
+      if (start < pal2rgb.palette.length) { // skip row if out of range
+        var arow = $('<tr/>').appendTo(atable);
+        $('<td/>').text(name).appendTo(arow);
+        var inds = [];
+        for (var k = start; k < start + Math.abs(len); k++)
+          inds.push(k);
+        if (len < 0)
+          inds.reverse();
+        inds.forEach((i,index) => {
+          // handle long slices when layout != null
+          if (index > 0 && (i % 8) == 0) {
+            arow = $('<tr/>').appendTo(atable);
+            $('<td/>').text('').appendTo(arow);
+          }
+          var cell = $('<td/>').addClass('asset_cell asset_editable').appendTo(arow);
+          cells.push({ cell, index: i });
+          updateCell(cell, i);
+          cell.click((e) => {
+            var picker = new pixed.PaletteColorPicker(pal2rgb.palfmt, allrgbimgs, (word) => {
+              callback(i, word);
+              updateCell(cell, i);
+            });
+            picker.recreate(aeditor, pal2rgb.words[i]);
+            this.setCurrentEditor(aeditor, cell, pal2rgb);
+          });
+        });
+      }
+    });
+    return updateAllCells;
+  }
+
+  addPixelEditor(parentdiv: JQuery, firstnode: pixed.PixNode, fmt: pixed.PixelEditorImageFormat) {
+    // data -> pixels
+    fmt.xform = 'scale(2)';
+    var mapper = new pixed.Mapper(fmt);
+    // TODO: rotate node?
+    firstnode.addRight(mapper);
+    // pixels -> RGBA
+    var palizer = new pixed.Palettizer(this, fmt);
+    mapper.addRight(palizer);
+    // add view objects
+    palizer.addRight(new pixed.CharmapEditor(this, newDiv(parentdiv), fmt));
+  }
+
+  // tile indices -> indexed image (converter) -> RGBA -> map viewer
+  addTilemapEditor(parentdiv: JQuery, firstnode: pixed.PixNode, converter: pixed.PixNode,
+    palfmt: pixed.PixelEditorImageFormat, mapfmt: pixed.PixelEditorImageFormat) {
+    var node = firstnode.addRight(converter);
+    node = node.addRight(new pixed.Palettizer(this, palfmt));
+    node.addRight(new pixed.MapEditor(this, newDiv(parentdiv), mapfmt));
+  }
+
+  // finds the contents of a named array declared in any text file of the project
+  getNamedArray(name: string): number[] | null {
+    var result: number[] | null = null;
+    current_project.iterateFiles((fileid, data) => {
+      if (!result && typeof data === 'string') result = pixed.findNamedArray(data, name);
+    });
+    return result;
+  }
+
+  addPaletteEditor(parentdiv: JQuery, firstnode: pixed.PixNode, palfmt?) {
+    // palette -> RGBA
+    var pal2rgb = new pixed.PaletteFormatToRGB(palfmt);
+    firstnode.addRight(pal2rgb);
+    // TODO: refresh twice?
+    firstnode.refreshRight();
+    var updateAllCells = this.addPaletteEditorViews(parentdiv, pal2rgb,
+      (index, newvalue) => {
+        console.log('set entry', index, '=', newvalue);
+        // TODO: this forces update of palette rgb colors and file data
+        firstnode.words[index] = newvalue;
+        pal2rgb.words = null;
+        pal2rgb.updateRight();
+        pal2rgb.refreshLeft();
+      });
+    // add view node to repaint cells when data changes (e.g. undo)
+    pal2rgb.addRight(new pixed.PaletteEditorView(updateAllCells));
+  }
+
+  ensureFileDiv(fileid: string): JQuery<HTMLElement> {
+    var divid = this.getFileDivId(fileid);
+    var body = $(document.getElementById(divid));
+    if (body.length === 0) {
+      var filediv = newDiv(this.maindiv, 'asset_file');
+      var header = newDiv(filediv, 'asset_file_header').text(fileid);
+      body = newDiv(filediv).attr('id', divid).addClass('disable-select');
+    }
+    return body;
+  }
+
+  refreshAssetsInFile(fileid: string, data: FileData): number {
+    let nassets = 0;
+    // TODO: check fmt w/h/etc limits
+    // TODO: defer editor creation
+    // TODO: only refresh when needed
+    if (platform_id.startsWith('nes') && fileid.endsWith('.chr') && data instanceof Uint8Array) {
+      // is this a NES CHR?
+      let node = new pixed.FileDataNode(projectWindows, fileid);
+      const neschrfmt = { w: 8, h: 8, bpp: 1, count: (data.length >> 4), brev: true, np: 2, pofs: 8, remap: [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12] }; // TODO
+      this.addPixelEditor(this.ensureFileDiv(fileid), node, neschrfmt);
+      this.registerAsset("charmap", node, 1);
+      nassets++;
+    } else if (platform_id.startsWith('nes') && fileid.endsWith('.pal') && data instanceof Uint8Array) {
+      // is this a NES PAL?
+      let node = new pixed.FileDataNode(projectWindows, fileid);
+      const nespalfmt = { pal: "nes", layout: "nes" };
+      this.addPaletteEditor(this.ensureFileDiv(fileid), node, nespalfmt);
+      this.registerAsset("palette", node, 0);
+      nassets++;
+    } else if (typeof data === 'string') {
+      let textfrags = this.scanFileTextForAssets(fileid, data);
+      for (let frag of textfrags) {
+        const block = $('<div class="asset_block"/>')
+          .attr({ 'data-fileid': fileid, 'data-startline': frag.startline })
+          .appendTo(this.ensureFileDiv(fileid));
+        var snip = $('<div class="asset_snip"/>').appendTo(block);
+        var linenos = $('<span class="asset_linenos"/>').appendTo(snip);
+        $('<span class="asset_lineno"/>').text('↗ ').appendTo(linenos);
+        $('<span class="asset_lineno"/>').text(frag.startline).appendTo(linenos);
+        linenos.append('-');
+        $('<span class="asset_lineno"/>').text(frag.endline).appendTo(linenos);
+        linenos.attr('title', 'Jump to source');
+        linenos.click(() => {
+          var editor = projectWindows.createOrShow(frag.fileid, true);
+          if (editor && (editor as any).highlightLines) {
+            (editor as any).highlightLines(frag.startline - 1, (typeof frag.endline === 'number' && frag.endline > 0 ? frag.endline : frag.startline) - 1);
+          }
+        });
+        snip.append(' ' + frag.header);
+        if (frag.error) {
+          $('<div class="asset_error_msg"/>').text(frag.error).appendTo(block);
+          continue;
+        }
+        if (frag.fmt) {
+          let node: pixed.PixNode;
+          let first: pixed.PixNode;
+          if (frag.embedFile) {
+            // C23 #embed "file.bin" -- edit the referenced binary file directly
+            const embedFileid = this.resolveEmbedFile(fileid, frag.embedFile);
+            const embedData = embedFileid && current_project.getFile(embedFileid);
+            if (!embedFileid || !(embedData instanceof Uint8Array)) {
+              $('<div class="asset_error_msg"/>').text(`#embed: file not found: "${frag.embedFile}"`).appendTo(block);
+              continue;
+            }
+            const assetError = pixed.validateAssetByteLength(embedData.length, frag.fmt);
+            if (assetError) {
+              $('<div class="asset_error_msg"/>').text(assetError).appendTo(block);
+              continue;
+            }
+            node = new pixed.FileDataNode(projectWindows, embedFileid);
+          } else {
+            // validate data block size before creating editors
+            const assetError = pixed.validateAssetData(data.substring(frag.start, frag.end), frag.fmt)
+              || (frag.fmt.map == 'charpad' ? pixed.validateCharpadFormat(frag.fmt, (n) => this.getNamedArray(n))
+                : frag.fmt.map == 'tilemap' ? pixed.validateTilemapFormat(frag.fmt, (n) => this.getNamedArray(n)) : null);
+            if (assetError) {
+              $('<div class="asset_error_msg"/>').text(assetError).appendTo(block);
+              continue;
+            }
+            let label = fileid; // TODO: label
+            node = new pixed.TextDataNode(projectWindows, fileid, label, frag.start, frag.end, frag.fmt.bpw);
+          }
+          first = node;
+          // rle-compressed? TODO: how to edit?
+          if (frag.fmt.comp == 'rletag') {
+            node = node.addRight(new pixed.Compressor());
+          }
+          // is this a nes nametable?
+          if (frag.fmt.map == 'nesnt') {
+            const fmt = { w: 8 * (frag.fmt.w || 32), h: 8 * (frag.fmt.h || 30), count: 1 }; // TODO: can't do custom sizes
+            this.addTilemapEditor(block, node, new pixed.NESNametableConverter(this), { w: 8, h: 8, bpp: 4 }, fmt);
+            this.registerAsset("nametable", first, 2);
+            nassets++;
+          }
+          // is this a CharPad (C64) map?
+          else if (frag.fmt.map == 'charpad') {
+            const cp = frag.fmt as pixed.CharpadFormat;
+            const fmt = { w: cp.w * cp.tw * 8, h: cp.h * cp.th * 8, count: 1 };
+            this.addTilemapEditor(block, node, new pixed.CharpadConverter(this, cp), { w: 8, h: 8, bpp: 4, defpal: 'c64' }, fmt);
+            this.registerAsset("nametable", first, 2);
+            nassets++;
+          }
+          // is this a generic tile map?
+          else if (frag.fmt.map == 'tilemap') {
+            const tm = frag.fmt as pixed.TilemapFormat;
+            const fmt = { w: tm.w * 8, h: tm.h * 8, count: 1 };
+            this.addTilemapEditor(block, node, new pixed.TilemapConverter(this, tm), { w: 8, h: 8, bpp: 4 }, fmt);
+            this.registerAsset("nametable", first, 2);
+            nassets++;
+          }
+          // is this a bitmap?
+          else if (frag.fmt.w > 0 && frag.fmt.h > 0) {
+            this.addPixelEditor(block, node, frag.fmt);
+            this.registerAsset("charmap", first, 1);
+            nassets++;
+          }
+          // is this a palette?
+          else if (frag.fmt.pal) {
+            this.addPaletteEditor(block, node, frag.fmt);
+            this.registerAsset("palette", first, 0);
+            nassets++;
+          }
+          else {
+            // TODO: other kinds of resources?
+          }
+        }
+      }
+    }
+    return nassets;
+  }
+
+  // resolve a #embed "file.bin" path against the project file list
+  resolveEmbedFile(fileid: string, embedName: string): string | null {
+    return pixed.resolveEmbedPath(fileid, embedName, (path) => current_project.getFile(path) !== undefined);
+  }
+
+  getFileDivId(id: string) {
+    return '__asset__' + safeident(id);
+  }
+
+  // TODO: recreate editors when refreshing
+  // TODO: look for changes, not moveCursor
+  refresh(moveCursor: boolean) {
+    // clear and refresh all files/nodes?
+    if (moveCursor) {
+      this.maindiv.empty();
+      this.clearAssets();
+      current_project.iterateFiles((fileid, data) => {
+        try {
+          // Clear stale tracked ranges before re-scanning this file.
+          projectWindows.clearAssetRanges(fileid);
+          var nassets = this.refreshAssetsInFile(fileid, data);
+        } catch (e) {
+          console.log(e);
+          this.ensureFileDiv(fileid).text(e + ""); // TODO: error msg?
+        }
+      });
+      console.log("Found " + this.rootnodes.length + " assets");
+      this.deferrednodes.forEach((node) => {
+        try {
+          node.refreshRight();
+        } catch (e) {
+          console.log(e);
+          alert(e + "");
+        }
+      });
+      this.deferrednodes = [];
+      if (this.maindiv.children().length === 0) {
+        $('<div class="asset_no_assets"/>')
+          .text("No asset declarations found.")
+          .appendTo(this.maindiv);
+      }
+      this.scrollToAssetFromHash();
+    } else {
+      if (this.rootnodes.length > 0) {
+        this.maindiv.find('.asset_no_assets').remove();
+      }
+      for (var node of this.rootnodes) {
+        node.refreshRight();
+      }
+    }
+  }
+
+  scrollToAssetFromHash(): void {
+    var hash = window.location.hash;
+    if (!hash || !hash.startsWith('#asseteditor/')) return;
+    var parts = hash.substring(1).split('/'); // ['asseteditor', ...filename, startline]
+    var fileid = decodeURIComponent(parts.slice(1, -1).join('/'));
+    var startline = parts[parts.length - 1];
+    if (!fileid || !startline) return;
+    // defer to allow DOM to settle
+    setTimeout(() => {
+      const block = this.maindiv.find(`.asset_block[data-fileid="${fileid}"][data-startline="${startline}"]`);
+      if (block.length) {
+        block[0].scrollIntoView({ behavior: "smooth", block: "center" });
+        block.addClass('asset_highlight');
+        setTimeout(() => block.removeClass('asset_highlight'), 500);
+      }
+    }, 0);
+  }
+
+  setVisible?(showing: boolean): void {
+    // TODO: make into toolbar?
+    if (showing) {
+      // ensure asset editor is safe to perform synchronous reads/writes
+      projectWindows.flushAllWindows();
+      // limit undo/redo to since opening this asset editor
+      projectWindows.undoStack = [];
+      projectWindows.redoStack = [];
+      const Mousetrap = getMousetrap();
+      if (Mousetrap.bind) {
+        Mousetrap.bind('mod+z', (e) => { projectWindows.undoStep(); return false; });
+        Mousetrap.bind('mod+shift+z', (e) => { projectWindows.redoStep(); return false; });
+      }
+      // focus so the shortcut bar's view chips (undo/redo) show
+      this.maindiv && this.maindiv[0] && this.maindiv[0].focus();
+    } else {
+      const Mousetrap = getMousetrap();
+      if (Mousetrap.unbind) {
+        Mousetrap.unbind('mod+z');
+        Mousetrap.unbind('mod+shift+z');
+      }
+    }
+  }
+
+}
+

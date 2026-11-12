@@ -1,0 +1,369 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.CodeProject = exports.LocalForageFilesystem = exports.OverlayFilesystem = exports.NullFilesystem = exports.WebPresetsFileSystem = void 0;
+exports.createNewPersistentStore = createNewPersistentStore;
+const localforage_1 = __importDefault(require("localforage"));
+const util_1 = require("../common/util");
+const projectcore_1 = require("../common/projectcore");
+const workertypes_1 = require("../common/workertypes");
+class WebPresetsFileSystem {
+    constructor(platform_id) {
+        this.preset_id = (0, util_1.getBasePlatform)(platform_id); // remove .suffix from preset name
+    }
+    async getRemoteFile(path) {
+        // always fetch bytes, then sniff the content -- the extension alone can't
+        // tell a binary resource (e.g. .vgr3) from text
+        const data = await (0, util_1.fetchWithBinary)(path, 'arraybuffer');
+        return data instanceof Uint8Array ? (0, util_1.bytesToFileData)(path, data) : data;
+    }
+    async getFileData(path) {
+        // found on remote fetch?
+        var webpath = "presets/" + this.preset_id + "/" + path;
+        var data = await this.getRemoteFile(webpath);
+        if (data)
+            console.log("read", webpath, data.length, 'bytes');
+        return data;
+    }
+    async setFileData(path, data) {
+        // not implemented
+    }
+    onFileSystemUpdate(callback) {
+        // not implemented
+    }
+}
+exports.WebPresetsFileSystem = WebPresetsFileSystem;
+class NullFilesystem {
+    constructor() {
+        this.gets = [];
+        this.sets = [];
+    }
+    getFileData(path) {
+        this.gets.push(path);
+        return null;
+    }
+    setFileData(path, data) {
+        this.sets.push(path);
+        return;
+    }
+    onFileSystemUpdate(callback) {
+        // not implemented
+    }
+}
+exports.NullFilesystem = NullFilesystem;
+class OverlayFilesystem {
+    constructor(basefs, overlayfs) {
+        this.basefs = basefs;
+        this.overlayfs = overlayfs;
+    }
+    async getFileData(path) {
+        var data = await this.overlayfs.getFileData(path);
+        if (data == null) {
+            return this.basefs.getFileData(path);
+        }
+        else {
+            return data;
+        }
+    }
+    async setFileData(path, data) {
+        await this.overlayfs.setFileData(path, data);
+        return this.basefs.setFileData(path, data);
+    }
+    onFileSystemUpdate(callback) {
+        this.overlayfs.onFileSystemUpdate(callback);
+        this.basefs.onFileSystemUpdate(callback);
+    }
+}
+exports.OverlayFilesystem = OverlayFilesystem;
+class LocalForageFilesystem {
+    constructor(store) {
+        this.store = store;
+    }
+    async getFileData(path) {
+        return this.store.getItem(path);
+    }
+    async setFileData(path, data) {
+        return this.store.setItem(path, data);
+    }
+    onFileSystemUpdate(callback) {
+        // not implemented
+    }
+}
+exports.LocalForageFilesystem = LocalForageFilesystem;
+function isEmptyString(text) {
+    return typeof text == 'string' && text.trim && text.trim().length == 0;
+}
+class CodeProject {
+    constructor(worker, platform_id, platform, filesystem) {
+        this.filedata = {};
+        this.pendingWorkerMessages = 0;
+        this.tools_preloaded = {};
+        this.isCompiling = false;
+        this.filename2path = {}; // map stripped paths to full paths
+        // pending ad-hoc worker queries (queryWorker), keyed by qid
+        this.pendingQueries = {};
+        this.queryCounter = 0;
+        /** Files are read through the project cache, then the filesystem. */
+        this.fileProvider = {
+            readFile: async (path) => { var _a, _b; return (_b = (_a = (await this.loadFiles([path]))[0]) === null || _a === void 0 ? void 0 : _a.data) !== null && _b !== void 0 ? _b : null; },
+        };
+        this.worker = worker;
+        this.platform_id = platform_id;
+        this.platform = platform;
+        this.filesystem = filesystem;
+        worker.onmessage = (e) => {
+            this.receiveWorkerMessage(e.data);
+        };
+        worker.onerror = (e) => {
+            var _a;
+            // The worker died (a toolchain that would not load, say). Report it
+            // instead of waiting forever for a build result that never arrives.
+            console.error('worker error', e.message || e);
+            this.pendingWorkerMessages = 0;
+            this.isCompiling = false;
+            if (this.callbackBuildStatus)
+                this.callbackBuildStatus(false);
+            var msg = e.message || 'Worker error';
+            (_a = this.callbackBuildResult) === null || _a === void 0 ? void 0 : _a.call(this, { errors: [{ line: 0, msg: msg }] });
+        };
+        filesystem.onFileSystemUpdate(async (path) => {
+            if (path in this.filedata) {
+                var data = await this.filesystem.getFileData(path);
+                if (data) {
+                    this.updateFile(path, data);
+                    if (this.onFileChanged)
+                        this.onFileChanged(path, data);
+                }
+            }
+        });
+    }
+    receiveWorkerMessage(data) {
+        // ad-hoc query responses (queryWorker) are tagged with a qid
+        if (data && data.qid != null) {
+            var qfn = this.pendingQueries[data.qid];
+            if (qfn) {
+                delete this.pendingQueries[data.qid];
+                qfn(data);
+            }
+            return;
+        }
+        var notfinal = this.pendingWorkerMessages > 1;
+        if (notfinal) {
+            this.sendBuild();
+            this.pendingWorkerMessages = 1;
+        }
+        else {
+            if (this.callbackBuildStatus)
+                this.callbackBuildStatus(false);
+            if (!this.isCompiling) {
+                console.log(this.pendingWorkerMessages);
+                console.trace();
+            } // debug compile problems
+            this.isCompiling = false;
+            this.pendingWorkerMessages = 0;
+        }
+        if (data && (0, workertypes_1.isOutputResult)(data)) {
+            this.processBuildResult(data);
+        }
+        else if ((0, workertypes_1.isErrorResult)(data)) {
+            this.processBuildListings(data);
+        }
+        this.callbackBuildResult(data);
+    }
+    /**
+     * Send an ad-hoc message to the worker and await its (qid-tagged) response.
+     * Used for non-build queries like readshared/listshared. Resolves with the
+     * raw WorkerResult, or null on timeout.
+     */
+    queryWorker(msg) {
+        return new Promise((resolve) => {
+            var qid = ++this.queryCounter;
+            this.pendingQueries[qid] = (result) => {
+                clearTimeout(timer);
+                resolve(result);
+            };
+            var timer = setTimeout(() => {
+                delete this.pendingQueries[qid];
+                resolve(null);
+            }, 15000);
+            msg.qid = qid;
+            this.worker.postMessage(msg);
+        });
+    }
+    getToolForFilename(path) {
+        if (this.remoteTool) {
+            return "remote:" + this.remoteTool;
+        }
+        else {
+            return this.platform.getToolForFilename(path);
+        }
+    }
+    preloadTool(tool) {
+        if (tool && !this.tools_preloaded[tool]) {
+            this.worker.postMessage({ preload: tool, platform: this.platform_id });
+            this.tools_preloaded[tool] = true;
+        }
+    }
+    loadFileDependencies(text) {
+        return (0, projectcore_1.resolveDependencies)(this.fileProvider, this.mainPath, text, this.platform_id, (path) => this.getToolForFilename(path));
+    }
+    okToSend() {
+        return this.pendingWorkerMessages++ == 0 && this.mainPath != null;
+    }
+    updateFileInStore(path, text) {
+        this.filesystem.setFileData(path, text);
+    }
+    buildWorkerMessage(depends) {
+        var { msg, filename2path, preloads } = (0, projectcore_1.buildWorkerMessage)({
+            mainPath: this.mainPath,
+            mainData: this.getFile(this.mainPath),
+            platformId: this.platform_id,
+            getToolForFilename: (path) => this.getToolForFilename(path),
+            symbols: this.buildSymbols,
+            buildArgs: this.buildArgs,
+            dataItems: this.dataItems,
+        }, depends);
+        Object.assign(this.filename2path, filename2path);
+        for (var tool of preloads)
+            this.preloadTool(tool);
+        return msg;
+    }
+    // TODO: get local file as well as presets?
+    async loadFiles(paths) {
+        var result = [];
+        var addResult = (path, data) => {
+            result.push({
+                path: path,
+                filename: this.stripLocalPath(path),
+                link: true,
+                data: data
+            });
+        };
+        for (var path of paths) {
+            // look in cache
+            if (path in this.filedata) { // found in cache?
+                var data = this.filedata[path];
+                if (data) {
+                    addResult(path, data);
+                }
+            }
+            else {
+                var data = await this.filesystem.getFileData(path);
+                if (data) {
+                    this.filedata[path] = data; // do not update store, just cache
+                    addResult(path, data);
+                }
+                else {
+                    this.filedata[path] = null; // mark entry as invalid
+                }
+            }
+        }
+        return result;
+    }
+    getFile(path) {
+        return this.filedata[path];
+    }
+    // TODO: purge files not included in latest build?
+    iterateFiles(callback) {
+        for (var path in this.filedata) {
+            callback(path, this.getFile(path));
+        }
+    }
+    sendBuild() {
+        if (!this.mainPath)
+            throw Error("need to call setMainFile first");
+        var maindata = this.getFile(this.mainPath);
+        // if binary blob, just return it as ROM
+        if (maindata instanceof Uint8Array) {
+            this.isCompiling = true;
+            this.receiveWorkerMessage({
+                output: maindata,
+                errors: [],
+                listings: null,
+                symbolmap: null,
+                params: {}
+            });
+            return;
+        }
+        // otherwise, make it a string
+        var text = typeof maindata === "string" ? maindata : '';
+        return this.loadFileDependencies(text).then((depends) => {
+            if (!depends)
+                depends = [];
+            var workermsg = this.buildWorkerMessage(depends);
+            this.worker.postMessage(workermsg);
+            this.isCompiling = true;
+        });
+    }
+    updateFile(path, text) {
+        if (this.filedata[path] == text)
+            return; // unchanged, don't update
+        this.updateFileInStore(path, text); // TODO: isBinary
+        this.filedata[path] = text;
+        if (this.okToSend()) {
+            if (this.callbackBuildStatus)
+                this.callbackBuildStatus(true);
+            this.sendBuild();
+        }
+    }
+    ;
+    setMainFile(path) {
+        this.mainPath = path;
+        if (this.callbackBuildStatus)
+            this.callbackBuildStatus(true);
+        this.sendBuild();
+    }
+    processBuildListings(data) {
+        // TODO: link listings with source files
+        if (data.listings) {
+            this.listings = data.listings;
+            (0, projectcore_1.processListings)(this.listings);
+        }
+    }
+    processBuildResult(data) {
+        this.processBuildListings(data);
+        this.processBuildSegments(data);
+    }
+    processBuildSegments(data) {
+        var native = this.platform.getMemoryMap && this.platform.getMemoryMap()["main"];
+        this.segments = (0, projectcore_1.mergeSegments)(native, data.segments);
+    }
+    getListings() {
+        return this.listings;
+    }
+    // returns first listing in format [prefix].lst (TODO: could be better)
+    getListingForFile(path) {
+        return (0, projectcore_1.getListingForFile)(this.getListings(), path, this.mainPath);
+    }
+    stripLocalPath(path) {
+        return (0, projectcore_1.stripLocalPath)(path, this.mainPath);
+    }
+    /**
+     * Set per-project build overrides (symbols / raw args per phase). These are
+     * layered above platform defaults but below the source's own //# directives,
+     * matching the CLI's --define/--cflag/... options. Triggers a rebuild.
+     */
+    setBuildOverrides(symbols, buildArgs) {
+        this.buildSymbols = symbols;
+        this.buildArgs = buildArgs;
+        if (this.okToSend())
+            this.sendBuild();
+    }
+    updateDataItems(items) {
+        this.dataItems = items;
+        if (this.okToSend()) { // TODO? mainpath == null?
+            this.sendBuild(); // TODO: don't need entire build?
+        }
+    }
+}
+exports.CodeProject = CodeProject;
+function createNewPersistentStore(storeid) {
+    var store = localforage_1.default.createInstance({
+        name: "__" + storeid,
+        version: 2.0
+    });
+    return store;
+}
+//# sourceMappingURL=project.js.map

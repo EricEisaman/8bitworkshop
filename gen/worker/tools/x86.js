@@ -1,0 +1,120 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.compileSmallerC = compileSmallerC;
+exports.assembleYASM = assembleYASM;
+const toolmeta_1 = require("../../common/toolmeta");
+const builder_1 = require("../builder");
+const listingutils_1 = require("../listingutils");
+const wasmutils_1 = require("../wasmutils");
+const mcpp_1 = require("./mcpp");
+// http://www.techhelpmanual.com/829-program_startup___exit.html
+function compileSmallerC(step) {
+    (0, wasmutils_1.loadNative)("smlrc");
+    var params = step.params;
+    // stderr
+    var re_err1 = /^Error in "[/]*(.+)" [(](\d+):(\d+)[)]/;
+    var errors = [];
+    var errline = 0;
+    var errpath = step.path;
+    function match_fn(s) {
+        var matches = re_err1.exec(s);
+        if (matches) {
+            errline = parseInt(matches[2]);
+            errpath = matches[1];
+        }
+        else {
+            errors.push({
+                line: errline,
+                msg: s,
+                path: errpath,
+            });
+        }
+    }
+    (0, builder_1.gatherFiles)(step, { mainFilePath: "main.c" });
+    var destpath = step.prefix + '.asm';
+    if ((0, builder_1.staleFiles)(step, [destpath])) {
+        var args = ['-seg16',
+            //'-nobss',
+            '-no-externs',
+            step.path, destpath];
+        var smlrc = wasmutils_1.emglobal.smlrc({
+            instantiateWasm: (0, wasmutils_1.moduleInstFn)('smlrc'),
+            noInitialRun: true,
+            //logReadFiles:true,
+            print: match_fn,
+            printErr: match_fn,
+        });
+        // set up filesystem with the preprocessed source
+        var FS = smlrc.FS;
+        //setupFS(FS, '65-'+getRootBasePlatform(step.platform));
+        const err = (0, mcpp_1.prepareCompilerInput)(step, 'smlrc', FS, params, args);
+        if (err)
+            return err;
+        const runerr = (0, wasmutils_1.execToFile)(step, smlrc, args, FS, destpath, errors);
+        if (runerr)
+            return runerr;
+    }
+    return {
+        nexttool: "yasm",
+        path: destpath,
+        args: [destpath],
+        files: [destpath],
+    };
+}
+function assembleYASM(step) {
+    (0, wasmutils_1.loadNative)("yasm");
+    var params = step.params;
+    var errors = [];
+    (0, builder_1.gatherFiles)(step, { mainFilePath: "main.asm" });
+    var objpath = step.prefix + ".exe";
+    var lstpath = step.prefix + ".lst";
+    var mappath = step.prefix + ".map";
+    if ((0, builder_1.staleFiles)(step, [objpath])) {
+        var args = ['-X', 'vc',
+            '-a', 'x86', '-f', 'dosexe', '-p', 'nasm',
+            '-D', 'freedos',
+            //'-g', 'dwarf2',
+            //'-I/share/asminc',
+            '-o', objpath, '-l', lstpath, '--mapfile=' + mappath,
+            step.path];
+        // return yasm/*.ready*/
+        var YASM = wasmutils_1.emglobal.yasm({
+            instantiateWasm: (0, wasmutils_1.moduleInstFn)('yasm'),
+            noInitialRun: true,
+            //logReadFiles:true,
+            print: wasmutils_1.print_fn,
+            printErr: (0, listingutils_1.msvcErrorMatcher)(errors),
+        });
+        var FS = YASM.FS;
+        //setupFS(FS, '65-'+getRootBasePlatform(step.platform));
+        (0, builder_1.populateFiles)(step, FS);
+        (0, builder_1.fixParamsWithDefines)(step.path, step.params);
+        // //#symbol as / //#flag as (insert before the source filename)
+        args.splice(args.length - 1, 0, ...(0, toolmeta_1.defineArgs)('yasm', params.symbols && params.symbols.assembler), ...(0, toolmeta_1.extraArgsFor)('yasm', params.buildArgs));
+        (0, wasmutils_1.execMain)(step, YASM, args);
+        if (errors.length)
+            return { errors: errors };
+        var objout, lstout, mapout;
+        objout = FS.readFile(objpath, { encoding: 'binary' });
+        lstout = FS.readFile(lstpath, { encoding: 'utf8' });
+        mapout = FS.readFile(mappath, { encoding: 'utf8' });
+        (0, builder_1.putWorkFile)(objpath, objout);
+        (0, builder_1.putWorkFile)(lstpath, lstout);
+        //putWorkFile(mappath, mapout);
+        if (!(0, builder_1.anyTargetChanged)(step, [objpath]))
+            return;
+        var symbolmap = {};
+        var segments = [];
+        var lines = (0, listingutils_1.parseListing)(lstout, /\s*(\d+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+(.+)/i, 1, 2, 3);
+        var listings = {};
+        listings[lstpath] = { lines: lines, text: lstout };
+        return {
+            output: objout, //.slice(0),
+            listings: listings,
+            errors: errors,
+            symbolmap: symbolmap,
+            segments: segments
+        };
+    }
+}
+//# sourceMappingURL=x86.js.map

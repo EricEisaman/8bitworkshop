@@ -1,0 +1,1177 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Base6809MachinePlatform = exports.BaseZ80MachinePlatform = exports.Base6502MachinePlatform = exports.BaseMachinePlatform = exports.Base6809Platform = exports.BaseZ80Platform = exports.Base6502Platform = exports.BaseDebugPlatform = exports.TRAP_SPIN_FRAMES = exports.BasePlatform = exports.BreakpointList = exports.DebugSymbols = exports.getToolForFilename_z80 = exports.getToolForFilename_arm32 = exports.getToolForFilename_6809 = exports.getToolForFilename_6502 = void 0;
+exports.isDebuggable = isDebuggable;
+exports.inspectSymbol = inspectSymbol;
+exports.cpuStateToLongString_6502 = cpuStateToLongString_6502;
+exports.getOpcodeMetadata_6502 = getOpcodeMetadata_6502;
+exports.cpuStateToLongString_Z80 = cpuStateToLongString_Z80;
+exports.cpuStateToLongString_SM83 = cpuStateToLongString_SM83;
+exports.cpuStateToLongString_6809 = cpuStateToLongString_6809;
+exports.dumpStackToString = dumpStackToString;
+exports.lookupSymbol = lookupSymbol;
+exports.hasVideo = hasVideo;
+exports.hasAudio = hasAudio;
+exports.hasKeyInput = hasKeyInput;
+exports.hasJoyInput = hasJoyInput;
+exports.hasPaddleInput = hasPaddleInput;
+exports.isRaster = isRaster;
+exports.hasProbe = hasProbe;
+exports.hasBIOS = hasBIOS;
+exports.hasSerialIO = hasSerialIO;
+const disasm6502_1 = require("./cpu/disasm6502");
+const disasmz80_1 = require("./cpu/disasmz80");
+const ZilogZ80_1 = require("./cpu/ZilogZ80");
+const emu_1 = require("./emu");
+const util_1 = require("./util");
+const toolselect_1 = require("./toolselect");
+Object.defineProperty(exports, "getToolForFilename_6502", { enumerable: true, get: function () { return toolselect_1.getToolForFilename_6502; } });
+Object.defineProperty(exports, "getToolForFilename_6809", { enumerable: true, get: function () { return toolselect_1.getToolForFilename_6809; } });
+Object.defineProperty(exports, "getToolForFilename_arm32", { enumerable: true, get: function () { return toolselect_1.getToolForFilename_arm32; } });
+Object.defineProperty(exports, "getToolForFilename_z80", { enumerable: true, get: function () { return toolselect_1.getToolForFilename_z80; } });
+const audio_1 = require("./audio");
+const _6809_1 = require("./cpu/6809");
+const MOS6502_1 = require("./cpu/MOS6502");
+const probe_1 = require("./probe");
+const wasmplatform_1 = require("./wasmplatform");
+const sourcevars_1 = require("./sourcevars");
+;
+;
+class DebugSymbols {
+    constructor(symbolmap, debuginfo, symbolsizes) {
+        this.symbolmap = symbolmap;
+        this.debuginfo = debuginfo;
+        this.symbolsizes = symbolsizes;
+        this.addr2symbol = (0, util_1.invertMap)(symbolmap);
+        this.symbolAddrs = [...new Set(Object.values(symbolmap || {}))].sort((a, b) => a - b);
+        //// TODO: shouldn't be necc.
+        if (!this.addr2symbol[0x0])
+            this.addr2symbol[0x0] = '$00'; // needed for ...
+        this.addr2symbol[0x10000] = '__END__'; // ... dump memory to work
+    }
+}
+exports.DebugSymbols = DebugSymbols;
+function isDebuggable(arg) {
+    return arg && typeof arg.getDebugCategories === 'function';
+}
+// for composite breakpoints w/ single debug function
+class BreakpointList {
+    constructor() {
+        this.id2bp = {};
+    }
+    getDebugCondition() {
+        if (Object.keys(this.id2bp).length == 0) {
+            return null; // no breakpoints
+        }
+        else {
+            // evaluate all breakpoints
+            return () => {
+                var result = false;
+                for (var id in this.id2bp)
+                    if (this.id2bp[id].cond())
+                        result = true;
+                return result;
+            };
+        }
+    }
+}
+exports.BreakpointList = BreakpointList;
+;
+/////
+class BasePlatform {
+    constructor() {
+        this.recorder = null;
+        this.internalFiles = {};
+    }
+    setRecorder(recorder) {
+        this.recorder = recorder;
+    }
+    updateRecorder() {
+        // are we recording and do we need to save a frame?
+        if (this.recorder && this.isRunning() && this.recorder.frameRequested()) {
+            this.recorder.recordFrame(this.saveState());
+        }
+    }
+    inspect(sym) {
+        return inspectSymbol(this, sym);
+    }
+    getDebugTree() {
+        var _a;
+        var o = {};
+        o.state = this.saveState();
+        if ((_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.debuginfo) {
+            // source variables and globals have their own value views; listing the
+            // raw records here would only show where they are, not what they hold
+            const info = Object.assign({}, this.debugSymbols.debuginfo);
+            delete info['sourceVariables'];
+            delete info['globalVariables'];
+            if (Object.keys(info).length)
+                o.debuginfo = info;
+        }
+        return o;
+    }
+    readFile(path) {
+        return this.internalFiles[path];
+    }
+    writeFile(path, data) {
+        this.internalFiles[path] = data;
+        return true;
+    }
+}
+exports.BasePlatform = BasePlatform;
+// How many consecutive frame boundaries the CPU has to sit on a trap spin
+// before the program is declared dead. A debugger can stop in the stub for a
+// frame (a breakpoint, a single step), and one frame is not enough to tell a
+// real hang from that.
+exports.TRAP_SPIN_FRAMES = 10;
+function readTrapStackByte(platform, addr) {
+    const p = platform;
+    if (typeof p.readAddress === 'function')
+        return p.readAddress(addr) & 0xff;
+    if (p.machine && typeof p.machine.readConst === 'function')
+        return p.machine.readConst(addr) & 0xff;
+    if (p.machine && typeof p.machine.read === 'function')
+        return p.machine.read(addr) & 0xff;
+    return null;
+}
+// A jsr pushes its last byte, so the return address on top of the stack is
+// site + 2. SP points just below the last byte pushed.
+function trapSite6502(platform) {
+    const sp = platform.getSP();
+    if (typeof sp !== 'number')
+        return null;
+    const lo = readTrapStackByte(platform, 0x100 + ((sp + 1) & 0xff));
+    const hi = readTrapStackByte(platform, 0x100 + ((sp + 2) & 0xff));
+    if (lo == null || hi == null)
+        return null;
+    return (((hi << 8) | lo) - 2) & 0xffff;
+}
+// A call pushes site + 3; SP points at the low byte of the return address.
+function trapSiteZ80(platform) {
+    const sp = platform.getSP() & 0xffff;
+    const lo = readTrapStackByte(platform, sp);
+    const hi = readTrapStackByte(platform, (sp + 1) & 0xffff);
+    if (lo == null || hi == null)
+        return null;
+    return (((hi << 8) | lo) - 3) & 0xffff;
+}
+class BaseDebugPlatform extends BasePlatform {
+    constructor() {
+        super(...arguments);
+        this.debugSavedState = null;
+        this.debugBreakState = null;
+        this.debugTargetClock = 0;
+        this.debugClock = 0;
+        this.breakpoints = new BreakpointList();
+        this.frameCount = 0;
+        this.trapSpinFrames = 0;
+        // Some CPU cores save their program counter one byte before or after the
+        // opcode they are on, so a raw PC lands on an operand or on the previous
+        // instruction. debugPCDelta corrects it: getCPUState() and saveState()
+        // report PC + delta, which is the address of the opcode, the same address
+        // getPC() returns.
+        this.debugPCDelta = 0;
+    }
+    fixPC(c) { c.PC = (c.PC + this.debugPCDelta) & 0xffff; return c; }
+    unfixPC(c) { c.PC = (c.PC - this.debugPCDelta) & 0xffff; return c; }
+    // True if a breakpoint targets the effective PC (see EPC), which some
+    // platforms use to fold a bank offset into the address. Those need the CPU
+    // state to find, so they skip the cheap getPC() test in runEvalAtPC().
+    debugUsesEPC() { return false; }
+    setBreakpoint(id, cond) {
+        if (cond) {
+            this.breakpoints.id2bp[id] = { cond: cond };
+            this.restartDebugging();
+        }
+        else {
+            this.clearBreakpoint(id);
+        }
+    }
+    clearBreakpoint(id) {
+        delete this.breakpoints.id2bp[id];
+    }
+    hasBreakpoint(id) {
+        return this.breakpoints.id2bp[id] != null;
+    }
+    getDebugCallback() {
+        return this.breakpoints.getDebugCondition();
+    }
+    setupDebug(callback) {
+        this.onBreakpointHit = callback;
+    }
+    clearDebug() {
+        if (this.debugBreakState != null && this.debugSavedState != null) {
+            this.loadState(this.debugSavedState);
+        }
+        this.debugSavedState = null;
+        this.debugBreakState = null;
+        this.debugTargetClock = -1;
+        this.debugClock = 0;
+        this.onBreakpointHit = null;
+        this.clearBreakpoint('debug');
+        this.frameCount = 0;
+        this.trapSpinFrames = 0;
+    }
+    setDebugCondition(debugCond) {
+        this.setBreakpoint('debug', debugCond);
+    }
+    resetDebugging() {
+        if (this.debugSavedState) {
+            this.loadState(this.debugSavedState);
+        }
+        else {
+            this.debugSavedState = this.saveState();
+        }
+        this.debugClock = 0;
+        this.debugCallback = this.getDebugCallback();
+        this.debugBreakState = null;
+    }
+    restartDebugging() {
+        this.resetDebugging();
+        this.resume();
+    }
+    preFrame() {
+        // save state before frame, to record any inputs that happened pre-frame
+        if (this.debugCallback && !this.debugBreakState) {
+            // save state every frame and rewind debug clocks
+            this.debugSavedState = this.saveState();
+            this.debugTargetClock -= this.debugClock;
+            this.debugClock = 0;
+        }
+    }
+    postFrame() {
+        // reload debug state at end of frame after breakpoint
+        if (this.debugCallback && this.debugBreakState) {
+            this.loadState(this.debugBreakState);
+        }
+        this.frameCount++;
+    }
+    pollControls() {
+    }
+    nextFrame(novideo) {
+        this.pollControls();
+        this.updateRecorder();
+        this.preFrame();
+        var steps = this.advance(novideo);
+        this.postFrame();
+        this.checkTrapSpin();
+        return steps;
+    }
+    /** The PC a stop is at, including a banked effective PC where a platform
+     *  reports one in EPC. */
+    debugPC() {
+        const c = this.getCPUState();
+        return c && c.EPC != null ? c.EPC : (c ? c.PC : this.getPC());
+    }
+    /** The source variables live at the current PC, from the build's debug
+     *  info (urust, oscar64), keyed `name:type`; empty when there are none. */
+    getSourceVariables() {
+        var _a;
+        const vars = (0, sourcevars_1.sourceVariablesOf)((_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.debuginfo);
+        if (!vars.length)
+            return {};
+        return (0, sourcevars_1.sourceVariableTree)(vars, this.debugPC(), this.debugSymbols.symbolmap, this.debugSymbols.symbolsizes, a => (0, sourcevars_1.readSourceByte)(this, a)) || {};
+    }
+    /** The live source variables to draw at the end of the lines that name
+     *  them, keyed by 1-based line number; empty without variable info. */
+    getInlineSourceValues(lines, lineText, stopLine) {
+        var _a;
+        const vars = (0, sourcevars_1.sourceVariablesOf)((_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.debuginfo);
+        if (!vars.length)
+            return new Map();
+        return (0, sourcevars_1.inlineSourceValues)(vars, this.debugPC(), this.debugSymbols.symbolmap, this.debugSymbols.symbolsizes, lines, lineText, a => (0, sourcevars_1.readSourceByte)(this, a), stopLine);
+    }
+    /** The writable source-declared globals (`static`, `reg!`) and their
+     *  values, keyed `name:type`; constants in ROM are left out. */
+    getGlobalVariables() {
+        var _a;
+        const vars = (0, sourcevars_1.writableGlobalVariablesOf)((_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.debuginfo);
+        if (!vars.length)
+            return {};
+        return (0, sourcevars_1.globalVariableTree)(vars, a => (0, sourcevars_1.readSourceByte)(this, a)) || {};
+    }
+    getDebugTree() {
+        var _a, _b;
+        const tree = super.getDebugTree();
+        if ((0, sourcevars_1.sourceVariablesOf)((_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.debuginfo).length) {
+            tree.Locals = { $$: () => this.getSourceVariables() };
+        }
+        if ((0, sourcevars_1.writableGlobalVariablesOf)((_b = this.debugSymbols) === null || _b === void 0 ? void 0 : _b.debuginfo).length) {
+            tree.Globals = { $$: () => this.getGlobalVariables() };
+        }
+        return tree;
+    }
+    inspect(sym) {
+        var _a, _b;
+        const vars = (0, sourcevars_1.sourceVariablesOf)((_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.debuginfo);
+        if (vars.length) {
+            const v = (0, sourcevars_1.liveSourceVariables)(vars, this.debugPC(), this.debugSymbols.symbolmap, this.debugSymbols.symbolsizes).find(v => v.name === sym);
+            if (v)
+                return (0, sourcevars_1.formatSourceVariableLine)(v, a => (0, sourcevars_1.readSourceByte)(this, a));
+        }
+        const g = (0, sourcevars_1.globalVariablesOf)((_b = this.debugSymbols) === null || _b === void 0 ? void 0 : _b.debuginfo).find(g => g.name === sym);
+        if (g)
+            return (0, sourcevars_1.formatSourceVariableLine)(g, a => (0, sourcevars_1.readSourceByte)(this, a));
+        return super.inspect(sym);
+    }
+    /**
+     * The site of a trap the CPU is sitting on, read from the return address a
+     * `jsr` (6502) or `call` (Z80) pushed. Null where there is no such stack.
+     */
+    getTrapSite() {
+        return null;
+    }
+    /**
+     * urust's trap stub ends in a jump-to-self at `__trap_spin`. A program that
+     * reaches it has panicked and will never leave, but it is the program's way
+     * of stopping, so hosts would otherwise run it forever. Ten consecutive
+     * frame boundaries on the symbol is a hang; report the site the stub was
+     * called from and stop.
+     */
+    checkTrapSpin() {
+        var _a, _b;
+        const spin = (_b = (_a = this.debugSymbols) === null || _a === void 0 ? void 0 : _a.symbolmap) === null || _b === void 0 ? void 0 : _b['__trap_spin'];
+        if (typeof spin !== 'number') {
+            this.trapSpinFrames = 0;
+            return;
+        }
+        const pc = this.getPC();
+        // A clock-based CPU can end a frame mid-instruction, and its PC then names
+        // something other than the opcode (the VIC-20/C64 WASM cores do). Once a
+        // stable frame has put us on the spin, an unstable frame keeps the count:
+        // the CPU is still executing the jump-to-self.
+        if (this.isStable() || this.trapSpinFrames === 0) {
+            if (pc !== spin) {
+                this.trapSpinFrames = 0;
+                return;
+            }
+        }
+        if (++this.trapSpinFrames < exports.TRAP_SPIN_FRAMES)
+            return;
+        this.trapSpinFrames = 0;
+        const site = this.getTrapSite();
+        const halt = new emu_1.EmuHalt(site != null ? `Program trapped at $${(0, util_1.hex)(site, 4)}` : 'Program trapped in __trap_spin');
+        halt.pc = site != null ? site : spin;
+        throw halt;
+    }
+    evalDebugCondition() {
+        if (this.debugCallback && !this.debugBreakState) {
+            this.debugCallback();
+        }
+    }
+    wasBreakpointHit() {
+        return this.debugBreakState != null;
+    }
+    breakpointHit(targetClock, reason) {
+        console.log(this.debugTargetClock, targetClock, this.debugClock, this.isStable());
+        this.debugTargetClock = targetClock;
+        this.debugBreakState = this.saveState();
+        console.log("Breakpoint at clk", this.debugClock, "PC", this.debugBreakState.c.PC.toString(16));
+        this.pause();
+        if (this.onBreakpointHit) {
+            this.onBreakpointHit(this.debugBreakState, reason);
+        }
+    }
+    haltAndCatchFire(reason) {
+        this.breakpointHit(this.debugClock, reason);
+    }
+    runEval(evalfunc) {
+        this.setDebugCondition(() => {
+            if (++this.debugClock >= this.debugTargetClock && this.isStable()) {
+                var cpuState = this.getCPUState();
+                if (evalfunc(cpuState)) {
+                    this.breakpointHit(this.debugClock);
+                    return true;
+                }
+                else {
+                    return false;
+                }
+            }
+        });
+    }
+    runToPC(pc) {
+        this.runEvalAtPC(new Map(pc.map((a) => [a, null])));
+    }
+    // Runs until a breakpoint is hit, which can be a whole frame away, so it
+    // tests getPC() on its own rather than building a CPU state at every
+    // instruction. The state is only wanted once an address matches, to run
+    // that breakpoint's condition.
+    runEvalAtPC(targets) {
+        this.debugTargetClock++;
+        const useEPC = this.debugUsesEPC();
+        this.setDebugCondition(() => {
+            if (++this.debugClock < this.debugTargetClock || !this.isStable())
+                return;
+            if (!useEPC && !targets.has(this.getPC()))
+                return;
+            const c = this.getCPUState();
+            const epc = c.EPC != null ? c.EPC : c.PC;
+            if (!targets.has(epc))
+                return;
+            const cond = targets.get(epc);
+            if (cond && !cond(c))
+                return;
+            this.breakpointHit(this.debugClock);
+            return true;
+        });
+    }
+    runUntilReturn() {
+        var SP0 = this.getSP();
+        this.runEval((c) => {
+            return c.SP > SP0; // TODO: check for RTS/RET opcode
+        });
+    }
+    // step over one CPU instruction; if it is a subroutine call,
+    // run at full speed until the instruction following it
+    stepOver() {
+        var _a;
+        var p = this;
+        var pc = this.getPC();
+        var d = null;
+        var readfn = (_a = p.readAddress) === null || _a === void 0 ? void 0 : _a.bind(p);
+        if (readfn && p.disassemble) {
+            d = p.disassemble(pc, readfn);
+        }
+        if (d && d.iscall) {
+            // run until we return from the subroutine call
+            var nextPC = pc + d.nbytes;
+            this.debugTargetClock++;
+            this.runEval((c) => c.PC == nextPC);
+        }
+        else {
+            // not a call, just single-step
+            this.step();
+        }
+    }
+    hasCustomStepOver() { return false; }
+    runToFrameClock(clock) {
+        this.restartDebugging();
+        this.debugTargetClock = clock;
+        this.runEval(() => { return true; });
+    }
+    step() {
+        this.runToFrameClock(this.debugClock + 1);
+    }
+    stepBack() {
+        var prevState;
+        var prevClock;
+        var clock0 = this.debugTargetClock;
+        this.restartDebugging();
+        this.debugTargetClock = clock0 - 25; // TODO: depends on CPU
+        this.runEval((c) => {
+            if (this.debugClock < clock0) {
+                prevState = this.saveState();
+                prevClock = this.debugClock;
+                return false;
+            }
+            else {
+                if (prevState) {
+                    this.loadState(prevState);
+                    this.debugClock = prevClock;
+                }
+                return true;
+            }
+        });
+    }
+    runToVsync() {
+        this.restartDebugging();
+        var frame0 = this.frameCount;
+        this.runEval(() => {
+            return this.frameCount > frame0;
+        });
+    }
+}
+exports.BaseDebugPlatform = BaseDebugPlatform;
+function inspectSymbol(platform, sym) {
+    if (!platform.debugSymbols)
+        return;
+    var symmap = platform.debugSymbols.symbolmap;
+    var addr2sym = platform.debugSymbols.addr2symbol;
+    if (!symmap || !platform.readAddress)
+        return null;
+    var addr = symmap["_" + sym] || symmap[sym]; // look for C or asm symbol
+    if (!(typeof addr == 'number'))
+        return null;
+    var b = platform.readAddress(addr);
+    // don't show 2 bytes if there's a symbol at the next address
+    if (addr2sym && addr2sym[addr + 1] != null) {
+        return "$" + (0, util_1.hex)(addr, 4) + " = $" + (0, util_1.hex)(b, 2) + " (" + b + " decimal)"; // unsigned
+    }
+    else {
+        let b2 = platform.readAddress(addr + 1);
+        let w = b | (b2 << 8);
+        return "$" + (0, util_1.hex)(addr, 4) + " = $" + (0, util_1.hex)(b, 2) + " $" + (0, util_1.hex)(b2, 2) + " (" + ((w << 16) >> 16) + " decimal)"; // signed
+    }
+}
+////// 6502
+// TODO: can merge w/ Z80?
+class Base6502Platform extends BaseDebugPlatform {
+    constructor() {
+        super(...arguments);
+        // the MOS6502 keeps its PC one byte past the opcode it fetched
+        this.debugPCDelta = -1;
+        this.getToolForFilename = toolselect_1.getToolForFilename_6502;
+    }
+    getSP() { return this.getCPUState().SP; }
+    ;
+    getPC() { return this.getCPUState().PC; }
+    ;
+    isStable() { return !this.getCPUState()['T']; }
+    newCPU(membus) {
+        var cpu = new MOS6502_1._MOS6502();
+        cpu.connectBus(membus);
+        return cpu;
+    }
+    getOpcodeMetadata(opcode, offset) {
+        return getOpcodeMetadata_6502(opcode, offset);
+    }
+    getOriginPC() {
+        return (this.readAddress(0xfffc) | (this.readAddress(0xfffd) << 8)) & 0xffff;
+    }
+    getTrapSite() {
+        return trapSite6502(this);
+    }
+    disassemble(pc, read) {
+        return (0, disasm6502_1.disassemble6502)(pc, read(pc), read(pc + 1), read(pc + 2));
+    }
+    getDefaultExtensions() { return [".c", ".sdcc", ".cpp", ".o64", ".acme", ".xa", ".ca65", ".dasm", ".ecs", ".wiz"]; }
+    ;
+    getDebugCategories() {
+        return ['CPU', 'ZPRAM', 'Stack'];
+    }
+    getDebugInfo(category, state) {
+        switch (category) {
+            case 'CPU': return cpuStateToLongString_6502(state.c);
+            case 'ZPRAM': return (0, emu_1.dumpRAM)(state.b || state.ram, 0x0, 0x100);
+            case 'Stack': return dumpStackToString(this, state.b || state.ram, 0x100, 0x1ff, 0x100 + state.c.SP, 0x20);
+        }
+    }
+}
+exports.Base6502Platform = Base6502Platform;
+function cpuStateToLongString_6502(c) {
+    function decodeFlags(c) {
+        var s = "";
+        s += c.N ? " N" : " -";
+        s += c.V ? " V" : " -";
+        s += c.D ? " D" : " -";
+        s += c.Z ? " Z" : " -";
+        s += c.C ? " C" : " -";
+        s += c.I ? " I" : " -";
+        return s;
+    }
+    return "PC " + (0, util_1.hex)(c.PC, 4) + "  " + decodeFlags(c) + "\n"
+        + " A " + (0, util_1.hex)(c.A) + "     " + (c.R ? "" : "BUSY") + "\n"
+        + " X " + (0, util_1.hex)(c.X) + "\n"
+        + " Y " + (0, util_1.hex)(c.Y) + "     " + "SP " + (0, util_1.hex)(c.SP) + "\n";
+}
+var OPMETA_6502 = {
+    cycletime: [
+        7, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6, 2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 0, 7, 4, 4, 7, 7, 6, 6, 0, 8, 3, 3, 5, 5, 4, 2, 2, 2, 4, 4, 6, 6, 2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 0, 7, 4, 4, 7, 7, 6, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 3, 4, 6, 6, 2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 0, 7, 4, 4, 7, 7, 6, 6, 0, 8, 3, 3, 5, 5, 4, 2, 2, 2, 5, 4, 6, 6, 2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 0, 7, 4, 4, 7, 7, 0, 6, 0, 6, 3, 3, 3, 3, 2, 0, 2, 0, 4, 4, 4, 4, 2, 6, 0, 0, 4, 4, 4, 4, 2, 5, 2, 0, 0, 5, 0, 0, 2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 0, 4, 4, 4, 4, 2, 5, 0, 5, 4, 4, 4, 4, 2, 4, 2, 0, 4, 4, 4, 4, 2, 6, 0, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 3, 6, 2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 0, 7, 4, 4, 7, 7, 2, 6, 0, 8, 3, 3, 5, 5, 2, 2, 2, 0, 4, 4, 6, 6, 2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 0, 7, 4, 4, 7, 7
+    ],
+    extracycles: [
+        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1
+    ],
+    insnlengths: [
+        1, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 0, 3, 3, 3, 3, 3, 3, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 0, 3, 3, 3, 3, 3, 1, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 0, 3, 3, 3, 3, 3, 1, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 0, 3, 3, 3, 3, 3, 0, 2, 0, 2, 2, 2, 2, 2, 1, 0, 1, 0, 3, 3, 3, 3, 2, 2, 0, 0, 2, 2, 2, 3, 1, 3, 1, 0, 0, 3, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 1, 0, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 1, 0, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 0, 3, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 0, 3, 3, 3, 3, 2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 0, 3, 3, 3, 3, 3
+    ],
+    validinsns: [
+        1, 2, 0, 0, 0, 2, 2, 0, 1, 2, 1, 0, 0, 3, 3, 0, 2, 2, 0, 0, 0, 2, 2, 0, 1, 3, 0, 0, 0, 3, 3, 0, 3, 2, 0, 0, 2, 2, 2, 0, 1, 2, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 0, 2, 2, 0, 1, 3, 0, 0, 0, 3, 3, 0, 1, 2, 0, 0, 0, 2, 2, 0, 1, 2, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 0, 2, 2, 0, 1, 3, 0, 0, 0, 3, 3, 0, 1, 2, 0, 0, 0, 2, 2, 0, 1, 2, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 0, 2, 2, 0, 1, 3, 0, 0, 0, 3, 3, 0, 0, 2, 0, 0, 2, 2, 2, 0, 1, 0, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 2, 2, 2, 0, 1, 3, 1, 0, 0, 3, 0, 0, 2, 2, 2, 0, 2, 2, 2, 0, 1, 2, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 2, 2, 2, 0, 1, 3, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 2, 2, 2, 0, 1, 2, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 0, 2, 2, 0, 1, 3, 0, 0, 0, 3, 3, 0, 2, 2, 0, 0, 2, 2, 2, 0, 1, 2, 1, 0, 3, 3, 3, 0, 2, 2, 0, 0, 0, 2, 2, 0, 1, 3, 0, 0, 0, 3, 3, 0
+    ],
+};
+function getOpcodeMetadata_6502(opcode, address) {
+    // TODO: more intelligent maximum cycles
+    // TODO: must always be new object, b/c we might modify it
+    return {
+        opcode: opcode,
+        minCycles: OPMETA_6502.cycletime[opcode],
+        maxCycles: OPMETA_6502.cycletime[opcode] + OPMETA_6502.extracycles[opcode],
+        insnlength: OPMETA_6502.insnlengths[opcode]
+    };
+}
+////// Z80
+function cpuStateToLongString_Z80(c) {
+    function decodeFlags(flags) {
+        return (0, util_1.printFlags)(flags, ["S", "Z", , "H", , "V", "N", "C"], true);
+    }
+    return "PC " + (0, util_1.hex)(c.PC, 4) + "  " + decodeFlags(c.AF) + " " + (c.iff1 ? "I" : "-") + (c.iff2 ? "I" : "-") + "\n"
+        + "SP " + (0, util_1.hex)(c.SP, 4) + "  IR " + (0, util_1.hex)(c.IR, 4) + "\n"
+        + "IX " + (0, util_1.hex)(c.IX, 4) + "  IY " + (0, util_1.hex)(c.IY, 4) + "\n"
+        + "AF " + (0, util_1.hex)(c.AF, 4) + "  BC " + (0, util_1.hex)(c.BC, 4) + "\n"
+        + "DE " + (0, util_1.hex)(c.DE, 4) + "  HL " + (0, util_1.hex)(c.HL, 4) + "\n";
+}
+function cpuStateToLongString_SM83(c) {
+    function decodeFlags(af) {
+        return (0, util_1.printFlags)(af, ["Z", "N", "H", "C"], true);
+    }
+    return "PC " + (0, util_1.hex)(c.PC, 4) + "  " + decodeFlags(c.AF >> 4) + " " + (c.ime ? "I" : "-") + "\n"
+        + "SP " + (0, util_1.hex)(c.SP, 4) + "\n"
+        + "AF " + (0, util_1.hex)(c.AF, 4) + "  BC " + (0, util_1.hex)(c.BC, 4) + "\n"
+        + "DE " + (0, util_1.hex)(c.DE, 4) + "  HL " + (0, util_1.hex)(c.HL, 4) + "\n";
+}
+class BaseZ80Platform extends BaseDebugPlatform {
+    constructor() {
+        super(...arguments);
+        this.waitCycles = 0;
+        this.getToolForFilename = toolselect_1.getToolForFilename_z80;
+    }
+    newCPU(membus, iobus) {
+        this._cpu = new ZilogZ80_1.Z80();
+        this._cpu.connectMemoryBus(membus);
+        this._cpu.connectIOBus(iobus);
+        return this._cpu;
+    }
+    getPC() { return this._cpu.getPC(); }
+    getSP() { return this._cpu.getSP(); }
+    isStable() { return true; }
+    getTrapSite() {
+        return trapSiteZ80(this);
+    }
+    // TODO: refactor other parts into here
+    runCPU(cpu, cycles) {
+        this._cpu = cpu; // TODO?
+        this.waitCycles = 0; // TODO: needs to spill over betwenn calls
+        if (this.wasBreakpointHit())
+            return 0;
+        var debugCond = this.getDebugCallback();
+        var n = 0;
+        this.waitCycles += cycles;
+        while (this.waitCycles > 0) {
+            if (debugCond && debugCond()) {
+                debugCond = null;
+                break;
+            }
+            var cyc = cpu.advanceInsn();
+            n += cyc;
+            this.waitCycles -= cyc;
+        }
+        return n;
+    }
+    getDefaultExtensions() { return [".c", ".sdcc", ".ns", ".s", ".scc", ".sgb", ".z", ".wiz"]; }
+    ;
+    // TODO: Z80 opcode metadata
+    //this.getOpcodeMetadata = function() { }
+    getDebugCategories() {
+        return ['CPU', 'Stack'];
+    }
+    getDebugInfo(category, state) {
+        switch (category) {
+            case 'CPU': return cpuStateToLongString_Z80(state.c);
+            case 'Stack': {
+                var sp = (state.c.SP - 1) & 0xffff;
+                var start = sp & 0xff00;
+                var end = start + 0xff;
+                if (sp == 0)
+                    sp = 0x10000;
+                console.log(sp, start, end);
+                return dumpStackToString(this, [], start, end, sp, 0xcd);
+            }
+        }
+    }
+    disassemble(pc, read) {
+        return (0, disasmz80_1.disassembleZ80)(pc, read(pc), read(pc + 1), read(pc + 2), read(pc + 3));
+    }
+}
+exports.BaseZ80Platform = BaseZ80Platform;
+////// 6809
+function cpuStateToLongString_6809(c) {
+    function decodeFlags(flags) {
+        return (0, util_1.printFlags)(flags, ["E", "F", "H", "I", "N", "Z", "V", "C"], true);
+    }
+    return "PC " + (0, util_1.hex)(c.PC, 4) + "  " + decodeFlags(c.CC) + "\n"
+        + "SP " + (0, util_1.hex)(c.SP, 4) + "\n"
+        + "DP " + (0, util_1.hex)(c.DP, 2) + "\n"
+        + " A " + (0, util_1.hex)(c.A, 2) + "\n"
+        + " B " + (0, util_1.hex)(c.B, 2) + "\n"
+        + " X " + (0, util_1.hex)(c.X, 4) + "\n"
+        + " Y " + (0, util_1.hex)(c.Y, 4) + "\n"
+        + " U " + (0, util_1.hex)(c.U, 4) + "\n";
+}
+class Base6809Platform extends BaseZ80Platform {
+    constructor() {
+        super(...arguments);
+        //this.getOpcodeMetadata = function() { }
+        this.getToolForFilename = toolselect_1.getToolForFilename_6809;
+    }
+    // The 6809's stack layout is not the Z80's; urust does not target it.
+    getTrapSite() { return null; }
+    newCPU(membus) {
+        var cpu = Object.create((0, _6809_1.CPU6809)());
+        cpu.init(membus.write, membus.read, 0);
+        return cpu;
+    }
+    cpuStateToLongString(c) {
+        return cpuStateToLongString_6809(c);
+    }
+    disassemble(pc, read) {
+        // TODO: don't create new CPU
+        return Object.create((0, _6809_1.CPU6809)()).disasm(read(pc), read(pc + 1), read(pc + 2), read(pc + 3), read(pc + 4), pc);
+    }
+    getDefaultExtensions() { return [".c", ".lwasm", ".xasm"]; }
+    ;
+    getDebugCategories() {
+        return ['CPU', 'Stack'];
+    }
+    getDebugInfo(category, state) {
+        switch (category) {
+            case 'CPU': return cpuStateToLongString_6809(state.c);
+            default: return super.getDebugInfo(category, state);
+        }
+    }
+}
+exports.Base6809Platform = Base6809Platform;
+//TODO: how to get stack_end?
+function dumpStackToString(platform, mem, start, end, sp, jsrop, bigendian) {
+    var s = "";
+    var nraw = 0;
+    //s = dumpRAM(mem.slice(start,start+end+1), start, end-start+1);
+    function read(addr) {
+        if (addr < mem.length)
+            return mem[addr];
+        else
+            return platform.readAddress(addr);
+    }
+    while (sp < end) {
+        sp++;
+        // see if there's a JSR on the stack here
+        // TODO: make work with roms and memory maps
+        var addr = read(sp) + read(sp + 1) * 256;
+        if (bigendian) {
+            addr = ((addr & 0xff) << 8) | ((addr & 0xff00) >> 8);
+        }
+        var jsrofs = jsrop == 0x20 ? -2 : -3; // 6502 vs Z80
+        var opcode = read(addr + jsrofs); // might be out of bounds
+        if (opcode == jsrop) { // JSR
+            s += "\n$" + (0, util_1.hex)(sp) + ": ";
+            s += (0, util_1.hex)(addr, 4) + " " + lookupSymbol(platform, addr, true);
+            sp++;
+            nraw = 0;
+        }
+        else {
+            if (nraw == 0)
+                s += "\n$" + (0, util_1.hex)(sp) + ": ";
+            s += (0, util_1.hex)(read(sp)) + " ";
+            if (++nraw == 8)
+                nraw = 0;
+        }
+    }
+    return s + "\n";
+}
+// TODO: slow, funky, uses global
+function lookupSymbol(platform, addr, extra) {
+    var start = addr;
+    var addr2symbol = platform.debugSymbols && platform.debugSymbols.addr2symbol;
+    while (addr2symbol && addr >= 0) {
+        var sym = addr2symbol[addr];
+        if (sym) { // return first symbol we find
+            var sym = addr2symbol[addr];
+            return extra ? (sym + " + $" + (0, util_1.hex)(start - addr)) : sym;
+        }
+        if (!extra)
+            break;
+        addr--;
+    }
+    return "";
+}
+function hasVideo(arg) {
+    return typeof arg.connectVideo === 'function';
+}
+function hasAudio(arg) {
+    return typeof arg.connectAudio === 'function';
+}
+function hasKeyInput(arg) {
+    return typeof arg.setKeyInput === 'function';
+}
+function hasJoyInput(arg) {
+    return typeof arg.setJoyInput === 'function';
+}
+function hasPaddleInput(arg) {
+    return typeof arg.setPaddleInput === 'function';
+}
+function isRaster(arg) {
+    return typeof arg.getRasterY === 'function';
+}
+function hasProbe(arg) {
+    return typeof arg.connectProbe == 'function';
+}
+function hasBIOS(arg) {
+    return typeof arg.loadBIOS == 'function';
+}
+function hasSerialIO(arg) {
+    return typeof arg.connectSerialIO === 'function';
+}
+class BaseMachinePlatform extends BaseDebugPlatform {
+    constructor(mainElement, options) {
+        super();
+        // The probe's singleFrame flag saved while runToVsync() holds a frame open,
+        // restored by pause() when the run stops (the run is timer-driven, so the
+        // stop happens after runToVsync() has returned).
+        this.probeSingleFrame = null;
+        this.mainElement = mainElement;
+        this.options = options || {};
+    }
+    reset() {
+        this.machine.reset();
+        if (this.serialVisualizer != null)
+            this.serialVisualizer.reset();
+    }
+    // The machine's CPU state is the core's own, so debugPCDelta corrects its PC
+    // on the way out and restores it on the way in. The machine's cpu.getPC()
+    // already names the opcode, so getPC() is left alone.
+    loadState(s) {
+        if (!this.debugPCDelta || !s.c)
+            return this.machine.loadState(s);
+        this.unfixPC(s.c);
+        try {
+            this.machine.loadState(s);
+        }
+        finally {
+            this.fixPC(s.c);
+        }
+    }
+    saveState() {
+        const s = this.machine.saveState();
+        if (this.debugPCDelta && s.c)
+            this.fixPC(s.c);
+        return s;
+    }
+    getSP() { return this.machine.cpu.getSP(); }
+    getPC() { return this.machine.cpu.getPC(); }
+    isStable() { return this.machine.cpu.isStable(); }
+    getCPUState() { return this.fixPC(this.machine.cpu.saveState()); }
+    loadControlsState(s) { this.machine.loadControlsState(s); }
+    saveControlsState() { return this.machine.saveControlsState(); }
+    async start() {
+        this.machine = this.newMachine();
+        const m = this.machine;
+        // block on WASM loading
+        if (m instanceof wasmplatform_1.BaseWASMMachine) {
+            await m.loadWASM();
+        }
+        var videoFrequency;
+        if (hasVideo(m)) {
+            var vp = m.getVideoParams();
+            this.video = new emu_1.RasterVideo(this.mainElement, vp.width, vp.height, {
+                overscan: !!vp.overscan,
+                rotate: vp.rotate | 0,
+                aspect: vp.aspect
+            });
+            this.video.create();
+            m.connectVideo(this.video.getFrameData());
+            // TODO: support keyboard w/o video?
+            if (hasKeyInput(m)) {
+                this.video.setKeyboardEvents(m.setKeyInput.bind(m));
+                this.poller = new emu_1.ControllerPoller(m.setKeyInput.bind(m));
+            }
+            videoFrequency = vp.videoFrequency;
+        }
+        this.timer = new emu_1.AnimationTimer(videoFrequency || 60, this.nextFrame.bind(this));
+        if (hasAudio(m)) {
+            var ap = m.getAudioParams();
+            this.audio = new audio_1.SampledAudio(ap.sampleRate);
+            this.audio.start();
+            m.connectAudio(this.audio);
+        }
+        if (hasPaddleInput(m)) {
+            this.video.setupMouseEvents();
+        }
+        if (hasProbe(m)) {
+            this.probeRecorder = new probe_1.ProbeRecorder(m);
+            this.startProbing = () => {
+                m.connectProbe(this.probeRecorder);
+                return this.probeRecorder;
+            };
+            this.stopProbing = () => {
+                m.connectProbe(null);
+            };
+        }
+        if (hasBIOS(m)) {
+            this.loadBIOS = (title, data) => {
+                m.loadBIOS(data, title);
+            };
+        }
+        if (hasSerialIO(m)) {
+            if (this.serialIOInterface == null) {
+                this.serialVisualizer = new SerialIOVisualizer(this.mainElement, m);
+            }
+            else {
+                m.connectSerialIO(this.serialIOInterface);
+            }
+        }
+    }
+    loadROM(title, data, origin) {
+        this.machine.loadROM(data, title, origin);
+        this.reset();
+    }
+    acceptsPaddles() {
+        return hasPaddleInput(this.machine);
+    }
+    setPaddles(x, y, buttons) {
+        // pollControls() passes these on to the machine at the next frame
+        this.video.paddle_x = x;
+        this.video.paddle_y = y;
+        buttons.forEach((b, i) => this.video.paddle_buttons[i] = b);
+    }
+    pollControls() {
+        this.poller && this.poller.poll();
+        if (hasPaddleInput(this.machine)) {
+            this.machine.setPaddleInput(0, this.video.paddle_x);
+            this.machine.setPaddleInput(1, this.video.paddle_y);
+            if (this.machine.setPaddleButton && this.video.paddle_buttons != null) {
+                this.machine.setPaddleButton(0, this.video.paddle_buttons[0]);
+                this.machine.setPaddleButton(1, this.video.paddle_buttons[1]);
+                this.machine.setPaddleButton(2, this.video.paddle_buttons[2]);
+            }
+        }
+        // TODO: put into interface
+        if (this.machine['pollControls']) {
+            this.machine['pollControls']();
+        }
+    }
+    advance(novideo) {
+        let trap = this.getDebugCallback();
+        try {
+            var steps = this.machine.advanceFrame(trap);
+            return steps;
+        }
+        finally {
+            // in case EmuHalt is thrown...
+            if (!novideo && this.video) {
+                this.video.updateFrame();
+                this.updateVideoDebugger();
+            }
+            if (!novideo && this.serialVisualizer) {
+                this.serialVisualizer.refresh();
+            }
+        }
+    }
+    updateVideoDebugger() {
+        var _a;
+        if (!this.isRunning() && isRaster(this.machine) && this.machine.getRasterCanvasPosition) {
+            const { x, y } = this.machine.getRasterCanvasPosition();
+            if (x >= 0 || y >= 0) {
+                const ctx = (_a = this.video) === null || _a === void 0 ? void 0 : _a.getContext();
+                if (ctx) {
+                    (0, emu_1.drawCrosshair)(ctx, x, y, 1);
+                }
+            }
+        }
+    }
+    advanceFrameClock(trap, step) {
+        if (!(step > 0))
+            return;
+        if (this.machine instanceof wasmplatform_1.BaseWASMMachine) {
+            return this.machine.advanceFrameClock(trap, step);
+        }
+        else {
+            return this.machine.advanceFrame(() => {
+                return --step <= 0;
+            });
+        }
+    }
+    isRunning() {
+        return this.timer && this.timer.isRunning();
+    }
+    resume() {
+        this.timer.start();
+        this.audio && this.audio.start();
+        this.poller && this.poller.start();
+    }
+    pause() {
+        this.timer.stop();
+        this.audio && this.audio.stop();
+        this.poller && this.poller.stop();
+        // runToVsync() holds a frame open for the probe; put the probe's own
+        // setting back now that the run has stopped.
+        if (this.probeRecorder && this.probeSingleFrame != null) {
+            this.probeRecorder.singleFrame = this.probeSingleFrame;
+            this.probeSingleFrame = null;
+        }
+    }
+    // so probe views stick around TODO: must be a better way?
+    runToVsync() {
+        // A single-frame step stops on the next frame boundary -- exactly where
+        // ProbeRecorder.logNewFrame() clears a singleFrame buffer -- which would
+        // leave the probe views blank. Clear here and hold the frame open until
+        // the run stops instead. pause() restores the saved setting.
+        if (this.probeRecorder) {
+            this.probeSingleFrame = this.probeRecorder.singleFrame;
+            this.probeRecorder.reset();
+            this.probeRecorder.singleFrame = false;
+        }
+        this.restartDebugging();
+        var flag = false;
+        this.runEval(() => {
+            if (this.getRasterScanline() > 0)
+                flag = true;
+            else
+                return flag;
+        });
+    }
+    // TODO: reset target clock counter
+    getRasterScanline() {
+        return isRaster(this.machine) && this.machine.getRasterY ? this.machine.getRasterY() : -1;
+    }
+    getRasterLineClock() {
+        return isRaster(this.machine) && this.machine.getRasterX ? this.machine.getRasterX() : -1;
+    }
+    readAddress(addr) {
+        return this.machine.read(addr);
+    }
+    getDebugCategories() {
+        if (isDebuggable(this.machine))
+            return this.machine.getDebugCategories();
+    }
+    getDebugInfo(category, state) {
+        return isDebuggable(this.machine) && this.machine.getDebugInfo(category, state);
+    }
+}
+exports.BaseMachinePlatform = BaseMachinePlatform;
+// TODO: move debug info into CPU?
+class Base6502MachinePlatform extends BaseMachinePlatform {
+    constructor() {
+        super(...arguments);
+        this.getOpcodeMetadata = getOpcodeMetadata_6502;
+    }
+    getTrapSite() {
+        return trapSite6502(this);
+    }
+    getToolForFilename(fn) { return (0, toolselect_1.getToolForFilename_6502)(fn); }
+    getDefaultExtensions() { return [".c", ".cpp", ".o64", ".acme", ".xa", ".ca65", ".dasm", ".ecs", ".wiz"]; }
+    disassemble(pc, read) {
+        return (0, disasm6502_1.disassemble6502)(pc, read(pc), read(pc + 1), read(pc + 2));
+    }
+    getDebugCategories() {
+        if (isDebuggable(this.machine))
+            return this.machine.getDebugCategories();
+        else
+            return ['CPU', 'ZPRAM', 'Stack'];
+    }
+    getDebugInfo(category, state) {
+        switch (category) {
+            case 'CPU': return cpuStateToLongString_6502(state.c);
+            case 'ZPRAM': return (0, emu_1.dumpRAM)(state.b || state.ram, 0x0, 0x100);
+            case 'Stack': return dumpStackToString(this, state.b || state.ram, 0x100, 0x1ff, 0x100 + state.c.SP, 0x20);
+            default: return isDebuggable(this.machine) && this.machine.getDebugInfo(category, state);
+        }
+    }
+}
+exports.Base6502MachinePlatform = Base6502MachinePlatform;
+class BaseZ80MachinePlatform extends BaseMachinePlatform {
+    constructor() {
+        super(...arguments);
+        //getOpcodeMetadata     = getOpcodeMetadata_z80;
+        this.getToolForFilename = toolselect_1.getToolForFilename_z80;
+    }
+    getTrapSite() {
+        return trapSiteZ80(this);
+    }
+    getDefaultExtensions() { return [".c", ".ns", ".s", ".scc", ".sgb", ".z", ".wiz"]; }
+    getDebugCategories() {
+        if (isDebuggable(this.machine))
+            return this.machine.getDebugCategories();
+        else
+            return ['CPU', 'Stack'];
+    }
+    getDebugInfo(category, state) {
+        switch (category) {
+            case 'CPU': return cpuStateToLongString_Z80(state.c);
+            case 'Stack': {
+                var sp = (state.c.SP - 1) & 0xffff;
+                var start = sp & 0xff00;
+                var end = start + 0xff;
+                if (sp == 0)
+                    sp = 0x10000;
+                return dumpStackToString(this, [], start, end, sp, 0xcd);
+            }
+            default: return isDebuggable(this.machine) && this.machine.getDebugInfo(category, state);
+        }
+    }
+    disassemble(pc, read) {
+        return (0, disasmz80_1.disassembleZ80)(pc, read(pc), read(pc + 1), read(pc + 2), read(pc + 3));
+    }
+}
+exports.BaseZ80MachinePlatform = BaseZ80MachinePlatform;
+class Base6809MachinePlatform extends BaseMachinePlatform {
+    constructor() {
+        super(...arguments);
+        this.getToolForFilename = toolselect_1.getToolForFilename_6809;
+    }
+    getDefaultExtensions() { return [".c", ".lwasm", ".xasm"]; }
+    getDebugCategories() {
+        if (isDebuggable(this.machine))
+            return this.machine.getDebugCategories();
+        else
+            return ['CPU', 'Stack'];
+    }
+    getDebugInfo(category, state) {
+        switch (category) {
+            case 'CPU': return cpuStateToLongString_6809(state.c);
+            case 'Stack': {
+                var sp = (state.c.SP - 1) & 0xffff;
+                var start = sp & 0xff00;
+                var end = start + 0xff;
+                if (sp == 0)
+                    sp = 0x10000;
+                return dumpStackToString(this, [], start, end, sp, 0x17, true);
+            }
+            default: return super.getDebugInfo(category, state);
+        }
+    }
+    disassemble(pc, read) {
+        // TODO: don't create new CPU
+        return Object.create((0, _6809_1.CPU6809)()).disasm(read(pc), read(pc + 1), read(pc + 2), read(pc + 3), read(pc + 4), pc);
+    }
+}
+exports.Base6809MachinePlatform = Base6809MachinePlatform;
+///
+class SerialIOVisualizer {
+    constructor(parentElement, device) {
+        this.lastOutCount = -1;
+        this.lastInCount = -1;
+        this.device = device;
+        this.textarea = document.createElement("textarea");
+        this.textarea.classList.add('transcript');
+        this.textarea.classList.add('transcript-style-2');
+        this.textarea.style.display = 'none';
+        parentElement.appendChild(this.textarea);
+        /*
+        this.vlist = new VirtualTextScroller(parentElement);
+        this.vlist.create(parentElement, 1024, this.getMemoryLineAt.bind(this));
+        this.vlist.maindiv.style.height = '8em';
+        this.vlist.maindiv.style.overflow = 'clip';
+        */
+    }
+    reset() {
+        this.lastOutCount = 0;
+        this.lastInCount = 0;
+        this.textarea.style.display = 'none';
+    }
+    refresh() {
+        var lastop = '';
+        if (this.device.serialOut.length != this.lastOutCount) {
+            var s = '';
+            for (var ev of this.device.serialOut) {
+                if (lastop != ev.op) {
+                    if (s != '')
+                        s += '\n';
+                    if (ev.op === 'read')
+                        s += '<< ';
+                    else if (ev.op === 'write')
+                        s += '>> ';
+                    lastop = ev.op;
+                }
+                if (ev.value == 10) {
+                    s += '\u21b5';
+                    lastop = '';
+                }
+                else {
+                    s += (0, util_1.byteToASCII)(ev.value);
+                }
+            }
+            this.textarea.value = s;
+            this.lastOutCount = this.device.serialOut.length;
+            this.textarea.style.display = 'block';
+        }
+    }
+}
+//# sourceMappingURL=baseplatform.js.map

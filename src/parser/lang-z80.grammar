@@ -1,0 +1,128 @@
+@top Program { Line* }
+
+@skip { space | Comment }
+
+Line {
+  RepeatBlock |
+  Label? Statement? eol
+}
+
+Statement {
+  Instruction |
+  Directive |
+  MacroDef |
+  ControlOp
+}
+
+Label { Identifier Colon Colon? | Identifier }
+
+Instruction {
+  Opcode Operand?
+}
+
+Directive {
+  PseudoOp (Expression)*
+}
+
+MacroDef {
+  Mac (Identifier (Comma Identifier)*)? eol Line* MacEnd
+}
+
+RepeatBlock {
+  Repeat Expression? eol Line* MacEnd eol
+}
+
+@external specialize {Identifier} pseudoOpSpecializer from "../../src/parser/tokens-z80" { PseudoOp }
+@external specialize {Identifier} macSpecializer from "../../src/parser/tokens-z80" { Mac, MacEnd, Repeat }
+@external specialize {Identifier} controlOpSpecializer from "../../src/parser/tokens-z80" { ControlOp }
+@external specialize {Identifier} opcodeSpecializer from "../../src/parser/tokens-z80" { Opcode }
+@external specialize {Identifier} registerSpecializer from "../../src/parser/tokens-z80" { Register }
+@external specialize {Identifier} conditionSpecializer from "../../src/parser/tokens-z80" { Condition }
+
+Expression {
+  Expression !logic LogicOp Expression |
+  Expression !bit BitOp Expression |
+  Expression !compare (CompareOp | BinaryLt | BinaryGt) Expression |
+  Expression !term (ArithOp | Plus | Minus | Percent) Expression |
+  UnaryExpression |
+  Value |
+  "(" Expression ")"
+}
+
+UnaryExpression {
+  (Plus | Minus | Not | Tilde | UnaryLt | UnaryGt) Expression
+}
+
+BinaryLt { lt !bin }
+BinaryGt { gt !bin }
+UnaryLt { lt !un }
+UnaryGt { gt !un }
+
+Value {
+  Number |
+  Identifier |
+  Register |
+  Condition |
+  String |
+  Char
+}
+
+Operand {
+  Expression (Comma Expression)*
+}
+
+@tokens {
+  Identifier { $[a-zA-Z_.?] $[a-zA-Z0-9_.?]* }
+
+  Hex { ("0x" | "0X" | "$") $[0-9a-fA-F]+ | $[0-9] $[0-9a-fA-F]* $[hH] }
+  Bin { $[01]+ $[bB] }
+  Oct { ("0o" | "0O") $[0-7]+ | $[0-7]+ $[oOqQ] }
+  Dec { $[0-9]+ $[dD]? }
+
+  Number { Hex | Bin | Oct | Dec }
+
+  String { '"' !["\n]* '"' }
+
+  Char { "'" !['\n] "'"? }
+
+  Comment { ";" ![\n]* }
+
+  space { $[ \t]+ }
+  eol { $[\n\r]+ }
+
+  Comma { "," }
+  Colon { ":" }
+  "#"
+  "(" ")"
+
+  ArithOp { "*" | "/" }
+  Percent { "%" }
+  Plus { "+" }
+  Minus { "-" }
+
+  BitOp { "&" | "|" | "^" | "<<" | ">>" }
+  Tilde { "~" }
+
+  LogicOp { "&&" | "||" }
+  Not { "!" }
+
+  CompareOp { "==" | "!=" | "<=" | ">=" }
+  lt { "<" }
+  gt { ">" }
+
+  @precedence { String, Char, Number, Percent, Identifier }
+}
+
+@precedence {
+  un,
+  term @left,
+  compare @left,
+  bit @left,
+  logic @left,
+  bin @left,
+  PseudoOp,
+  Opcode,
+  Label
+}
+
+@detectDelim

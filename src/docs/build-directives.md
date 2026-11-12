@@ -1,0 +1,341 @@
+# Build Directives
+
+A project can contain multiple files. The build system decides how each
+file is used based on directives in your source, and each file's
+extension selects the tool that compiles or assembles it.
+
+## Projects with multiple files
+
+All files in a project must be referenced from the main project file with
+one of these reference types:
+
+- **Include file** — a source file embedded in another using an
+  `#include` or similar directive.
+- **Linked file** — a source file compiled/assembled and linked into the
+  project alongside the main file, using the `//#link` or `;#link`
+  directive. A binary file can be included in an assembly project with the
+  `incbin` directive.
+- **Resource file** — a file that must be included in the project but is
+  neither included nor linked from the main file (for example it is
+  included from a non-main file). Use the `//#resource` or `;#resource`
+  directive.
+
+Here's a C example:
+
+```c
+//#link "lzg.c"
+#include "lzg.h"
+```
+
+If a file cannot be found, check the syntax. Often double quotes are
+required, e.g. `#include "file.inc"`.
+
+Only system files that are part of the compiler toolchain can be found
+with the `<foo.h>` syntax.
+
+Assembler files can include files using the `.include` or `.incbin`
+directives:
+
+```
+.segment "CHARS"
+.incbin "tileset.chr"
+```
+
+With DASM, make sure to quote the filename in `incbin`.
+
+## C preprocessor defines
+
+The preprocessor macro `__MAIN__` is defined when compiling the main C
+file of a project. You can use this to run tests on your module files:
+
+```c
+//#link "file_needed_for_test.c"
+#ifdef __MAIN__
+#include "file_needed_for_test.h"
+void main() {
+    test_my_module();
+}
+#endif
+```
+
+The macro `__8BITWORKSHOP__` is defined on all C files.
+
+## Build directives
+
+Build directives are comment lines that tell the build system how to
+compile, assemble, or link a project. They can appear in any source file
+and are never seen by the toolchain:
+
+- C, SDCC, and cmoc sources mark them with `//`.
+- Assembly sources mark them with `;`.
+
+The keyword follows the comment marker and a `#`, and the line must
+begin with the comment (leading whitespace is allowed).
+
+### `//#symbol` — define a symbol
+
+Defines a preprocessor macro, an assembler symbol, or a linker symbol:
+
+~~~c
+//#symbol [<phase>] NAME[=VALUE]
+~~~
+
+The optional *phase* is one of:
+
+| Phase | Meaning |
+| --- | --- |
+| `c`, `cc`, `compiler` | C preprocessor define (default) |
+| `as`, `asm`, `assembler` | assembler symbol |
+| `ld`, `link`, `linker` | linker symbol |
+
+A compiler define takes a text value (`cc65 -D`, `sdcc -D`). Assembler
+and linker symbols take an integer expression:
+
+~~~c
+//#symbol VERSION=3
+//#symbol as START=$8000
+//#symbol ld NES_MAPPER=4
+~~~
+
+A compiler define set in the main file applies to every C file in the
+project, so a library can size its storage from a macro the game sets
+(`//#symbol MAX_ENTITIES=24`, with an `#ifndef` default in the library
+header). A linker symbol is only a link-time value: it can supply a
+count read at run time but cannot size a C array, and SDCC needs a
+leading underscore (`//#symbol ld _LIMIT=24` for `extern char LIMIT`).
+
+A linker symbol defined by a source file replaces (rather than
+duplicates) a symbol of the same name that the platform already defines,
+so `//#symbol ld NES_MAPPER=...` can select a different mapper without
+editing the platform defaults. Linker values must be integer
+expressions; a text value is reported as a build error rather than
+passed to the linker.
+
+### `//#flag` — pass a raw argument
+
+Passes arguments straight to one tool phase, with no interpretation:
+
+~~~c
+//#flag <phase> <arg> [<arg> ...]
+~~~
+
+~~~c
+//#flag c -Osir
+//#flag as --cpu 65c02
+//#flag ld -m map.txt
+~~~
+
+Arguments may be quoted with single or double quotes when they contain
+spaces. This is an escape hatch that the build system cannot validate.
+
+If a flag names a file (for example urust's custom board), also list that
+file as a resource so the IDE and CLI copy it into the build filesystem:
+
+~~~rust
+//#resource "vicdual.toml"
+//#flag c --board vicdual.toml
+~~~
+
+### `//#tooldef` — set a typed build parameter
+
+Sets a named build parameter that the build system understands:
+
+~~~c
+//#tooldef <phase> NAME=VALUE
+~~~
+
+The supported parameters are:
+
+| Phase | Name | Meaning |
+| --- | --- | --- |
+| `ld` | `cfgfile` | linker configuration file to use (e.g. for CC65's ld65) |
+| `ld` | `libargs` | comma-separated list of library/symbol arguments |
+| `ld` | `code_start`, `data_start` | where SDCC's linker places the code and the RAM data (e.g. `0x4000`) |
+| `c` | `sdcc` | SDCC version, `3` or `4` (see *SDCC versions* below) |
+
+~~~c
+//#tooldef ld cfgfile=apple2-hgr2.cfg
+//#tooldef ld libargs=,nes.lib
+//#tooldef ld code_start=0x4000
+//#tooldef c sdcc=3
+~~~
+
+### Commenting out a directive
+
+To disable a directive, break the marker; for example, use `////#` in C
+or `;;#` in assembly. A directive that is already commented out is
+deliberately *not* recognized.
+
+### Legacy `#define` directives
+
+For backwards compatibility the build system still understands the older
+`#define`-based forms:
+
+| Legacy form | Same as |
+| --- | --- |
+| `#define CFGFILE <file>` | `//#tooldef ld cfgfile=<file>` |
+| `#define LIBARGS <a,b,...>` | `//#tooldef ld libargs=<a,b,...>` |
+| `#define NES_MAPPER <n>` | `//#symbol ld NES_MAPPER=<n>` |
+| `#define CC65_FLAGS <a,b,...>` | `//#flag c <a> <b> ...` |
+
+These may be prefixed with `;` or `/` as well (for example `;#define`),
+so they can appear in assembly sources. New code should prefer the
+explicit `//#` directives above.
+
+## CC65 custom config files
+
+CC65's linker is controlled with
+[configuration files](https://www.cc65.org/doc/ld65-5.html) that define
+memory areas and the layout of the final binary or ROM.
+
+Tell the linker to use a custom config file from your main C program:
+
+~~~c
+//#tooldef ld cfgfile=apple2-hgr2.cfg
+//#resource "apple2-hgr2.cfg"
+~~~
+
+The legacy form is also supported:
+
+~~~c
+#define CFGFILE apple2-hgr2.cfg
+//#resource "apple2-hgr2.cfg"
+~~~
+
+Note the lack of quotes around the file name.
+
+## CC65 `#embed` directive
+
+You can include binary files directly in
+CC65 `.c` files, a feature not available from the CC65 command line. For
+example, given an uploaded file `image-c64.multi.lz4`:
+
+~~~c
+const char image_c64_multi_lz4[] = {
+#embed "image-c64.multi.lz4"
+};
+~~~
+
+This creates a byte array named `image_c64_multi_lz4` with the contents
+of the binary file.
+
+The `#embed` directive is also supported in Oscar64 and Wiz files.
+
+## SDCC versions
+
+Z80 C files build with SDCC 3.6.5 by default, which compiles several times
+faster. SDCC 4 produces smaller code (roughly 10-20% on the samples we
+tried) but compiles more slowly, mostly in the register allocator. To build
+a project with SDCC 4, add this line to the main file:
+
+~~~c
+//#tooldef c sdcc=4
+~~~
+
+The whole project then compiles, assembles, and links with SDCC 4.
+Platforms whose libraries were compiled with SDCC 3.6.5 can't use SDCC 4,
+and `//#tooldef c sdcc=4` on one of them is a build error:
+
+| Platform | Library |
+| --- | --- |
+| `coleco`, `msx-libcv`, `sms-*` | libcv / libcvu |
+| `gb` | gb.lib |
+| `cpc.*` | cpctelera, cpcrslib |
+
+`//#tooldef c sdcc=3` selects SDCC 3.6.5 explicitly, which keeps working if
+the default changes. The default is `SDCC_DEFAULT_VERSION` in
+`src/common/toolmeta.ts`.
+
+Unless the source has a `#pragma opt_code_size`, `opt_code_speed` or
+`opt_code_balanced`, SDCC runs with `--no-peep --nolospre
+--max-allocs-per-node 500` for fast builds. Adding one of those pragmas
+turns the full optimizer back on.
+
+### Calling convention
+
+SDCC 4 passes function arguments in registers; SDCC 3 passed them on the
+stack. C code works either way, but an assembly function that reads its
+arguments from the stack breaks under SDCC 4. Mark such a function
+`__sdcccall(0)`, in its prototype too, to keep the old convention:
+
+~~~c
+void set_color(byte c) __sdcccall(0) __naked {
+  __asm
+    ld hl, #2
+    add hl, sp
+    ld a, (hl)   ; c is on the stack
+    out (0x40), a
+    ret
+  __endasm;
+}
+~~~
+
+Without `__sdcccall(0)`, SDCC 4 passes `c` in register `A`.
+
+### Warnings
+
+SDCC 4 warns about more code than SDCC 3, e.g. `int main(int argc)`.
+Warnings don't stop an SDCC 4 build and aren't marked in the editor. When
+a build fails, the IDE marks its warnings along with its errors.
+
+## SDCC `#pragma`
+
+With SDCC, enable additional optimization by adding one of these lines to
+the top of the file:
+
+~~~c
+#pragma opt_code_size  // for smaller code
+#pragma opt_code_speed // for faster code
+~~~
+
+Without a pragma, the IDE turns off some optimizations to keep builds
+fast. Either pragma slows builds but produces faster and smaller code.
+
+### Game Boy ROM banks
+
+The Game Boy builds with SDCC 3.6.5 (see *SDCC versions* above).
+`#pragma bank N` at the top of a file puts its code and
+constant data in ROM bank *N*, which the CPU sees at `$4000-$7FFF`. Link
+the file from your main file, and call its functions through `__banked`
+prototypes. Each call switches to the function's bank and back again:
+
+~~~c
+// bank1.c
+#pragma bank 1
+void say_hello(char* buf) __banked { ... }
+
+// main.c
+//#link "bank1.c"
+//#symbol ld GB_MAPPER=0x19
+void say_hello(char* buf) __banked;
+~~~
+
+The ROM grows to fit the highest bank, and the build writes the ROM size
+into the header. If `GB_MAPPER` is still 0 (ROM only), the build selects
+MBC5. A bank holds 16 KB; overflowing it is a build error. Banked data
+can only be read while its bank is mapped, so copy it out from a
+`__banked` function. See the *ROM Bank Switching* preset.
+
+## File extensions
+
+The extension of your source file determines the tool used to assemble
+or compile it. The current platform resolves extensions that several
+tools share (`.c`, `.s`, `.bas`), so the mapping depends on both. Common
+cases:
+
+| Extension | File type | Tool (platform) |
+| --- | --- | --- |
+| `.c` | C source file | cc65 (6502), sdcc (Z80), cmoc (6809) |
+| `-sdcc.c` | C source file on a 6502 platform | sdcc, mos6502 backend (SDCC 4 only; experimental, `devel-6502`) |
+| `.cpp` | C source file | Oscar64 (6502) |
+| `.s` `.ca65` | Assembler file | ca65 (6502) |
+| `.s` | Assembler file | sdasz80 (Z80) |
+| `.sgb` | Assembler file | sdasgb (Game Boy) |
+| `.dasm` `.a` | Assembler file | dasm (6502) |
+| `.z` | Assembler file | zmac (Z80) |
+| `.bas` | BASIC file | BASIC, batariBASIC (vcs), FastBASIC (atari8) |
+| `.bb` | batariBASIC file | batariBASIC (vcs) |
+| `.v` | Verilog file | Verilator |
+
+See [Toolchains & Platforms](toolchains.md) for the full
+platform × extension → tool table.

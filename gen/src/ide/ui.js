@@ -1,0 +1,2918 @@
+"use strict";
+// 8bitworkshop IDE user interface
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.lastDebugState = exports.projectWindows = exports.current_project = exports.platform = exports.repo_id = exports.store_id = exports.platform_id = exports.qs = exports.showTab = exports.setupSplits = void 0;
+exports.getPlatformStore = getPlatformStore;
+exports.getCurrentProject = getCurrentProject;
+exports.getCurrentOutput = getCurrentOutput;
+exports.getWorkerParams = getWorkerParams;
+exports.openHeaderFile = openHeaderFile;
+exports.getCurrentMainFilename = getCurrentMainFilename;
+exports.getCurrentEditorFilename = getCurrentEditorFilename;
+exports.parseGoToTarget = parseGoToTarget;
+exports.openLocationForPC = openLocationForPC;
+exports.setupBreakpoint = setupBreakpoint;
+exports.armBreakpoints = armBreakpoints;
+exports.runToPC = runToPC;
+exports.clearBreakpoint = clearBreakpoint;
+exports.setFrameRateUI = setFrameRateUI;
+exports.haltEmulation = haltEmulation;
+exports.gotoNewLocation = gotoNewLocation;
+exports.getPlatformAndRepo = getPlatformAndRepo;
+exports.startUI = startUI;
+exports.setTestInput = setTestInput;
+exports.getTestOutput = getTestOutput;
+exports.getSaveState = getSaveState;
+exports.emulationHalted = emulationHalted;
+exports.reloadWorkspaceFile = reloadWorkspaceFile;
+const localforage = __importStar(require("localforage"));
+const baseplatform_1 = require("../common/baseplatform");
+const emu_1 = require("../common/emu");
+const books_1 = require("../common/books");
+const controls_1 = require("../common/controls");
+const audio_1 = require("../common/audio");
+const hdlhost_1 = require("./hdlhost");
+const recorder_1 = require("../common/recorder");
+const util_1 = require("../common/util");
+const toolmeta_1 = require("../common/toolmeta");
+const version_1 = require("../common/version");
+const platforms_1 = require("../worker/platforms");
+const listingutils_1 = require("../worker/listingutils");
+const workertypes_1 = require("../common/workertypes");
+const projectcore_1 = require("../common/projectcore");
+const errorreport_1 = require("./errorreport");
+const _index_1 = require("../platform/_index");
+const dialogs_1 = require("./dialogs");
+const settings_1 = require("./settings");
+const storage_1 = require("./storage");
+const project_1 = require("./project");
+const services_1 = require("./services");
+const presetfilter_1 = require("./presetfilter");
+const shareexport_1 = require("./shareexport");
+const sync_1 = require("./sync");
+const toolbar_1 = require("./toolbar");
+const shortcutbar_1 = require("./shortcutbar");
+const searchview_1 = require("./search/searchview");
+const debuggerhit_1 = require("./search/debuggerhit");
+const projectsource_1 = require("./search/projectsource");
+const asseteditor_1 = require("./views/asseteditor");
+const baseviews_1 = require("./views/baseviews");
+const debugviews_1 = require("./views/debugviews");
+const editors_1 = require("./views/editors");
+const errormarkup_1 = require("./views/errormarkup");
+const helpview_1 = require("./views/helpview");
+const helptopics_1 = require("./helptopics");
+const treeviews_1 = require("./views/treeviews");
+const windows_1 = require("./windows");
+const layout_1 = require("./layout");
+Object.defineProperty(exports, "setupSplits", { enumerable: true, get: function () { return layout_1.setupSplits; } });
+Object.defineProperty(exports, "showTab", { enumerable: true, get: function () { return layout_1.showTab; } });
+const breakpoints_1 = require("./breakpoints");
+const listinglocation_1 = require("./search/listinglocation");
+const DOMPurify = require("dompurify");
+/// EXPORTED GLOBALS (TODO: remove)
+exports.qs = (0, util_1.decodeQueryString)(window.location.search || '?');
+// private globals
+var compparams; // received build params from worker
+var platform_name; // platform name (after setPlatformUI)
+var toolbar = $("#controls_top");
+var uitoolbar;
+var stateRecorder;
+var userPaused; // did user explicitly pause?
+var tabPausedEmulator = false; // did a tab switch (mobile tab mode) pause the emulator?
+var debugSessionActive; // has the user entered a debug session? (drives debug shortcut chips)
+var current_output; // current ROM (or other object)
+var current_preset; // current preset object (if selected)
+var selectedPresetFilter; // category filter for the project selector
+var store; // persistent store
+const isElectron = (0, util_1.parseBool)(exports.qs.electron);
+const isEmbed = (0, util_1.parseBool)(exports.qs.embed);
+var lastDebugInfo; // last debug info (CPU text)
+var debugCategory; // current debug category
+var debugTickPaused = false;
+var recorderActive = false;
+var lastViewClicked = null;
+var lastDebugCommand = null;
+var errorWasRuntime = false;
+var lastBreakExpr = "c.PC == 0x6000";
+function getPlatformStore() {
+    return store;
+}
+function getCurrentProject() {
+    return exports.current_project;
+}
+function getCurrentOutput() {
+    return current_output;
+}
+function getWorkerParams() {
+    return compparams;
+}
+// editor styles and help URLs live in the tool registry (src/common/toolmeta.ts)
+function newWorker() {
+    // TODO: return new Worker("https://8bitworkshop.com.s3-website-us-east-1.amazonaws.com/dev/gen/worker/bundle.js");
+    // The build id in the query string makes Firefox refetch the bundle after a
+    // rebuild (hard reload doesn't cover workers); the worker reuses it for its
+    // own fetches via cacheBust().
+    return new Worker("./gen/worker/bundle.js" + (typeof __BUILD_ID__ != 'undefined' ? '?v=' + __BUILD_ID__ : ''));
+}
+const hasLocalStorage = function () {
+    try {
+        const key = "__some_random_key_you_are_not_going_to_use__";
+        localStorage.setItem(key, key);
+        var has = localStorage.getItem(key) == key;
+        localStorage.removeItem(key);
+        return has;
+    }
+    catch (e) {
+        return false;
+    }
+}();
+// wrapper for localstorage
+class UserPrefs {
+    setLastPreset(id) {
+        if (hasLocalStorage && !isEmbed) {
+            if (exports.repo_id && exports.platform_id && !isElectron)
+                localStorage.setItem("__lastrepo_" + exports.platform_id, exports.repo_id);
+            else
+                localStorage.removeItem("__lastrepo_" + exports.platform_id);
+            localStorage.setItem("__lastplatform", exports.platform_id);
+            localStorage.setItem("__lastid_" + exports.store_id, id);
+        }
+    }
+    unsetLastPreset() {
+        if (hasLocalStorage && !isEmbed) {
+            delete exports.qs.file;
+            localStorage.removeItem("__lastid_" + exports.store_id);
+        }
+    }
+    getLastPreset() {
+        return hasLocalStorage && !isEmbed && localStorage.getItem("__lastid_" + exports.store_id);
+    }
+    setPresetFilter(id) {
+        if (hasLocalStorage && !isEmbed)
+            localStorage.setItem("__presetfilter_" + exports.platform_id, id);
+    }
+    getPresetFilter() {
+        return hasLocalStorage && !isEmbed && localStorage.getItem("__presetfilter_" + exports.platform_id);
+    }
+    getLastPlatformID() {
+        return hasLocalStorage && !isEmbed && localStorage.getItem("__lastplatform");
+    }
+    getLastRepoID(platform) {
+        return hasLocalStorage && !isEmbed && platform && localStorage.getItem("__lastrepo_" + platform);
+    }
+    // no platform has ever been loaded in this browser, so this is a first launch
+    isFirstVisit() {
+        return hasLocalStorage && !isEmbed && !localStorage.getItem("__lastplatform");
+    }
+    shouldCompleteTour() {
+        return hasLocalStorage && !isEmbed && !localStorage.getItem("8bitworkshop.hello");
+    }
+    completedTour() {
+        if (hasLocalStorage && !isEmbed)
+            localStorage.setItem("8bitworkshop.hello", "true");
+    }
+    // we only nag about non-persistent storage once per browser
+    shouldWarnAboutPersistence() {
+        return hasLocalStorage && !isEmbed && !localStorage.getItem("8bitworkshop.persistwarn");
+    }
+    warnedAboutPersistence() {
+        if (hasLocalStorage && !isEmbed)
+            localStorage.setItem("8bitworkshop.persistwarn", "true");
+    }
+}
+var userPrefs = new UserPrefs();
+// Ask the browser to keep our IndexedDB data around.
+// A denial is normal (Chrome/Safari decide on their own and never prompt), so
+// we treat it as advice rather than an error, and only say it once.
+// https://developer.mozilla.org/en-US/docs/Web/API/StorageManager/persist
+async function requestPersistPermission(interactive, failureonly) {
+    if (isElectron) {
+        // desktop version stores files in the local filesystem
+        interactive && (0, dialogs_1.alertInfo)("The desktop version keeps your files in the \"8bitworkshop\" directory, so browser storage permissions don't apply.");
+        return;
+    }
+    if (isEmbed) {
+        // third-party frames are always denied, so don't even ask
+        interactive && (0, dialogs_1.alertInfo)("Embedded pages can't be granted persistent storage. Open 8bitworkshop in its own tab to keep your edits.");
+        return;
+    }
+    var status = await (0, storage_1.requestPersistentStorage)();
+    console.log("requestPersistPermission =", status);
+    if (!interactive)
+        return;
+    if (status.persisted && failureonly)
+        return; // nothing worth interrupting for
+    // don't repeat the bad news on every new file, only when the user asks
+    if (!status.persisted && failureonly) {
+        if (!userPrefs.shouldWarnAboutPersistence())
+            return;
+        userPrefs.warnedAboutPersistence();
+    }
+    (0, dialogs_1.alertInfo)((0, storage_1.getPersistStatusMessage)(status, true));
+}
+var warnedQuotaExceeded = false;
+async function storageQuotaExceeded() {
+    if (warnedQuotaExceeded)
+        return;
+    warnedQuotaExceeded = true;
+    // requesting persistence can expand the quota, so try that before complaining
+    var status = await (0, storage_1.requestPersistentStorage)();
+    console.log("storageQuotaExceeded =", status);
+    (0, dialogs_1.alertError)((0, storage_1.getQuotaExceededMessage)(status));
+}
+function getCurrentPresetTitle() {
+    if (!current_preset)
+        return exports.current_project.mainPath || "ROM";
+    else
+        return current_preset.title || current_preset.name || exports.current_project.mainPath || "ROM";
+}
+async function newFilesystem() {
+    var basefs = new project_1.WebPresetsFileSystem(exports.platform_id);
+    if (isElectron) {
+        console.log('using electron with local filesystem', alternateLocalFilesystem);
+        return new project_1.OverlayFilesystem(basefs, alternateLocalFilesystem);
+    }
+    else if (exports.qs.localfs != null) {
+        return new project_1.OverlayFilesystem(basefs, await getLocalFilesystem(exports.qs.localfs));
+    }
+    else {
+        return new project_1.OverlayFilesystem(basefs, new project_1.LocalForageFilesystem(store));
+    }
+}
+async function initProject() {
+    var filesystem = await newFilesystem();
+    exports.current_project = new project_1.CodeProject(newWorker(), exports.platform_id, exports.platform, filesystem);
+    (0, projectsource_1.setProjectProvider)(() => exports.current_project);
+    exports.current_project.remoteTool = exports.qs.tool || null;
+    exports.projectWindows = new windows_1.ProjectWindows($("#workspace")[0], exports.current_project);
+    exports.current_project.callbackBuildResult = (result) => {
+        if ((0, workertypes_1.isErrorResult)(result) && result.internal && (0, util_1.isProductionHost)()) {
+            (0, errorreport_1.reportInternalError)('worker', result.internal, { tool: result.internal.tool, platform: result.internal.platform });
+        }
+        setCompileOutput(result);
+    };
+    exports.current_project.callbackBuildStatus = (busy) => {
+        setBusyStatus(busy);
+    };
+    // Update file views when file contents change.
+    exports.current_project.onFileChanged = (path, data) => {
+        var wnd = exports.projectWindows.id2window[path];
+        if (wnd) {
+            if (wnd instanceof editors_1.SourceEditor && typeof data === 'string') {
+                wnd.setText(data);
+            }
+            else if (wnd instanceof debugviews_1.BinaryFileView && data instanceof Uint8Array) {
+                wnd.setData(data);
+            }
+            else {
+                console.warn('onFileChanged: unknown view or data type');
+            }
+        }
+        // Also refresh the asset editor if it's the active view.
+        var assetWnd = exports.projectWindows.id2window['#asseteditor'];
+        if (assetWnd && assetWnd === exports.projectWindows.getActive()) {
+            assetWnd.refresh(true);
+        }
+    };
+}
+function setBusyStatus(busy) {
+    if (busy) {
+        toolbar.addClass("is-busy");
+    }
+    else {
+        toolbar.removeClass("is-busy");
+    }
+    $('#compile_spinner').css('visibility', busy ? 'visible' : 'hidden');
+}
+function newDropdownListItem(id, text) {
+    var li = document.createElement("li");
+    var a = document.createElement("a");
+    a.setAttribute("class", "dropdown-item");
+    var hash = id.startsWith('#') ? id : '#' + encodeURIComponent(id);
+    a.setAttribute("href", hash);
+    if (id == exports.projectWindows.getActiveID())
+        $(a).addClass("dropdown-item-checked");
+    a.appendChild(document.createTextNode(text));
+    li.appendChild(a);
+    return { li, a };
+}
+// Toolchain headers opened via include badges: each gets its own window
+// entry (alongside the listings) so it shows in the window list.
+var openHeaderViews = [];
+function registerHeaderView(fn) {
+    if (!openHeaderViews.includes(fn)) {
+        openHeaderViews.push(fn);
+        exports.projectWindows.setCreateFunc('#headerview/' + fn, () => new editors_1.HeaderView(fn));
+        refreshWindowList();
+    }
+}
+// urust's debug info names the embedded rs8 modules `rs8/<module>.rs`; the
+// editor opens them as `<module>.rs` (see the tool's includeDirs). The debugger
+// needs their window to show a stop or a breakpoint inside one.
+function headerWindowForListing(lstfn) {
+    if (!lstfn.startsWith('rs8/') || exports.current_project.getFile(lstfn) != null)
+        return null;
+    var fn = lstfn.substring('rs8/'.length);
+    registerHeaderView(fn);
+    return '#headerview/' + fn;
+}
+function openHeaderFile(fn) {
+    registerHeaderView(fn);
+    var hash = '#headerview/' + fn;
+    if (window.location.hash !== hash) {
+        window.location.hash = hash.substring(1);
+    }
+}
+function refreshWindowList() {
+    var ul = $("#windowMenuList").empty();
+    var separate = false;
+    function addWindowItem(id, name, createfn) {
+        if (separate) {
+            ul.append(document.createElement("hr"));
+            separate = false;
+        }
+        let { li, a } = newDropdownListItem(id, name);
+        // Tool windows get a one-line docs-derived tooltip; source files/listings
+        // don't (helpDescriptionForView returns undefined for them).
+        const desc = (0, helpview_1.helpDescriptionForView)(id);
+        if (desc)
+            a.setAttribute("title", desc);
+        ul.append(li);
+        if (createfn) {
+            var onopen = (id, wnd) => {
+                ul.find('a').removeClass("dropdown-item-checked");
+                $(a).addClass("dropdown-item-checked");
+            };
+            exports.projectWindows.setCreateFunc(id, createfn);
+            exports.projectWindows.setShowFunc(id, onopen);
+            $(a).click((e) => {
+                lastViewClicked = id;
+            });
+        }
+    }
+    function loadEditor(path) {
+        var _a;
+        var tool = exports.platform.getToolForFilename(path);
+        // hack because .h files can be DASM or CC65
+        if (tool == 'dasm' && path.endsWith(".h") && getCurrentMainFilename().endsWith(".c")) {
+            tool = 'cc65';
+        }
+        var mode = tool && ((_a = (0, toolmeta_1.getToolMeta)(tool)) === null || _a === void 0 ? void 0 : _a.editorStyle);
+        return new editors_1.SourceEditor(path, mode);
+    }
+    function addEditorItem(id) {
+        addWindowItem(id, (0, util_1.getFilenameForPath)(id), () => {
+            var data = exports.current_project.getFile(id);
+            if (typeof data === 'string')
+                return loadEditor(id);
+            else if (data instanceof Uint8Array)
+                return new debugviews_1.BinaryFileView(id, data);
+        });
+    }
+    // add main file editor
+    addEditorItem(exports.current_project.mainPath);
+    // add other source files
+    exports.current_project.iterateFiles((id, text) => {
+        if (text && id != exports.current_project.mainPath) {
+            addEditorItem(id);
+        }
+    });
+    // add listings
+    separate = true;
+    var listings = exports.current_project.getListings();
+    if (listings) {
+        for (var lstfn in listings) {
+            var lst = listings[lstfn];
+            // add listing if source/assembly file exists and has text
+            if ((lst.assemblyfile && lst.assemblyfile.text) || (lst.sourcefile && lst.sourcefile.text) || lst.text) {
+                addWindowItem(lstfn, (0, util_1.getFilenameForPath)(lstfn), (path) => {
+                    return new editors_1.ListingView(path);
+                });
+            }
+        }
+    }
+    // add opened toolchain headers (from include badges)
+    for (let hdrfn of openHeaderViews) {
+        let hdrid = '#headerview/' + hdrfn;
+        exports.projectWindows.setCreateFunc(hdrid, () => new editors_1.HeaderView(hdrfn));
+        addWindowItem(hdrid, (0, util_1.getFilenameForPath)(hdrfn), () => {
+            return new editors_1.HeaderView(hdrfn);
+        });
+    }
+    // add other tools
+    separate = true;
+    if (exports.platform.disassemble && exports.platform.saveState) {
+        addWindowItem("#disasm", "Disassembly", () => {
+            return new editors_1.DisassemblerView();
+        });
+    }
+    if (exports.platform.readAddress) {
+        addWindowItem("#memory", "Memory Browser", () => {
+            return new debugviews_1.MemoryView();
+        });
+    }
+    if (exports.current_project.segments && exports.current_project.segments.length) {
+        addWindowItem("#memmap", "Memory Map", () => {
+            return new debugviews_1.MemoryMapView();
+        });
+    }
+    if (exports.platform.readVRAMAddress) {
+        addWindowItem("#vram", "VRAM Browser", () => {
+            return new debugviews_1.VRAMMemoryView();
+        });
+    }
+    if (exports.platform.startProbing) {
+        addWindowItem("#memprobe", "Memory Probe", () => {
+            return new debugviews_1.AddressHeatMapView();
+        });
+        // TODO: only if raster
+        addWindowItem("#crtprobe", "CRT Probe", () => {
+            //return new RasterPCHeatMapView();
+            return new debugviews_1.RasterStackMapView();
+        });
+        addWindowItem("#probelog", "Probe Log", () => {
+            return new debugviews_1.ProbeLogView();
+        });
+        addWindowItem("#scanlineio", "Scanline I/O", () => {
+            return new debugviews_1.ScanlineIOView();
+        });
+        addWindowItem("#symbols", "Symbol Profiler", () => {
+            return new debugviews_1.ProbeSymbolView();
+        });
+        addWindowItem("#callgraph", "Call Graph", () => {
+            return new treeviews_1.CallGraphView();
+        });
+        /*
+        addWindowItem("#framecalls", "Frame Profiler", () => {
+          return new FrameCallsView();
+        });
+        */
+    }
+    if (exports.platform.getDebugTree) {
+        addWindowItem("#debugtree", "Debug Tree", () => {
+            return new treeviews_1.DebugBrowserView();
+        });
+    }
+    if ((0, breakpoints_1.canUseBreakpoints)()) {
+        addWindowItem("#breakpoints", "Breakpoints", () => {
+            return new debugviews_1.BreakpointsView();
+        });
+    }
+    addWindowItem('#asseteditor', 'Asset Editor', () => {
+        return new asseteditor_1.AssetEditorView();
+    });
+    // Help: markdown docs shipped with the IDE. Only the index is listed in the
+    // sidebar; every topic still gets a create fn so #help/<id> deep links work.
+    //separate = true;
+    addWindowItem('#help', 'Help', () => new helpview_1.HelpView('#help'));
+    for (let topic of helpview_1.HELP_TOPICS) {
+        exports.projectWindows.setCreateFunc('#help/' + topic.id, () => new helpview_1.HelpView(topic.id));
+    }
+}
+function highlightLines(path, hispec) {
+    if (hispec) {
+        var toks = exports.qs.highlight.split(',');
+        var start = parseInt(toks[0]) - 1;
+        var end = parseInt(toks[1]) - 1;
+        var editor = exports.projectWindows.createOrShow(path);
+        editor.highlightLines(start, end);
+    }
+}
+async function loadMainWindow(preset_id) {
+    // pre-load dependencies so refreshWindowList sees all files
+    var maindata = exports.current_project.getFile(preset_id);
+    if (typeof maindata === 'string') {
+        await exports.current_project.loadFileDependencies(maindata);
+    }
+    // we need this to build create functions for the editor
+    refreshWindowList();
+    // show main file
+    exports.projectWindows.createOrShow(preset_id);
+    // build project
+    exports.current_project.setMainFile(preset_id);
+    // highlighting?
+    highlightLines(preset_id, exports.qs.highlight);
+}
+async function loadProject(preset_id) {
+    // set current file ID
+    // TODO: this is done twice (mainPath and mainpath!)
+    exports.current_project.mainPath = preset_id;
+    // load persisted breakpoints for this platform/project
+    breakpoints_1.bpStore.setContextFn(() => exports.platform_id + '/' + exports.current_project.mainPath);
+    breakpoints_1.bpStore.load();
+    userPrefs.setLastPreset(preset_id);
+    // load files from storage or web URLs
+    var result = await exports.current_project.loadFiles([preset_id]);
+    if (result && result.length) {
+        // file found; continue
+        await loadMainWindow(preset_id);
+    }
+    else {
+        // file not found, look for skeleton file
+        var tool = exports.platform.getToolForFilename(preset_id);
+        var skel = await getSkeletonFile(preset_id);
+        exports.current_project.filedata[preset_id] = skel || "\n";
+        await loadMainWindow(preset_id);
+        // don't alert if we selected "new file" unless there's a problem
+        if (!exports.qs.newfile) {
+            (0, dialogs_1.alertInfo)("Could not find file \"" + preset_id + "\"<br><br>" +
+                "Creating new " + (skel ? tool : "blank") + " file.");
+        }
+        else if (!skel && !tool) {
+            (0, dialogs_1.alertError)("No build tool for \"" + preset_id + "\" on this platform; project will not build.");
+        }
+        else if (!skel) {
+            (0, dialogs_1.alertInfo)("No skeleton file for " + tool + " on this platform; using blank file.");
+        }
+        else {
+            requestPersistPermission(true, true); // ask for persist permissions
+        }
+        delete exports.qs.newfile;
+        replaceURLState();
+    }
+}
+function reloadProject(id) {
+    // leave repository == '/'
+    if (id == '/') {
+        exports.qs = { repo: '/' };
+    }
+    else if (id.indexOf('://') >= 0) {
+        var urlparse = (0, services_1.parseGithubURL)(id);
+        if (urlparse) {
+            exports.qs = { repo: urlparse.repopath };
+        }
+    }
+    else {
+        exports.qs.platform = exports.platform_id;
+        exports.qs.file = id;
+    }
+    gotoNewLocation();
+}
+async function getSkeletonFile(fileid) {
+    var ext = (0, toolmeta_1.getSkeletonName)(exports.platform.getToolForFilename(fileid));
+    try {
+        return await $.get("presets/" + (0, util_1.getBasePlatform)(exports.platform_id) + "/skeleton." + ext, 'text');
+    }
+    catch (e) {
+        console.log(e + "");
+        return null;
+    }
+}
+function checkEnteredFilename(fn) {
+    if (fn.indexOf(" ") >= 0) {
+        (0, dialogs_1.alertError)("No spaces in filenames, please.");
+        return false;
+    }
+    return true;
+}
+async function _getToolsWithSkeletons(extensions) {
+    var basePlatform = (0, util_1.getBasePlatform)(exports.platform_id);
+    // group extensions by tool id to avoid duplicate requests
+    var toolToExts = {};
+    var toolOrder = [];
+    for (var ext of extensions) {
+        var tool = exports.platform.getToolForFilename("test" + ext);
+        if (!toolToExts[tool]) {
+            toolToExts[tool] = [];
+            toolOrder.push(tool);
+        }
+        toolToExts[tool].push(ext);
+    }
+    // check each tool in parallel
+    var checks = toolOrder.map(tool => $.ajax({
+        url: "presets/" + basePlatform + "/skeleton." + (0, toolmeta_1.getSkeletonName)(tool),
+        type: "HEAD"
+    }).then(() => tool, () => null));
+    var validTools = await Promise.all(checks);
+    var results = [];
+    for (var validTool of validTools) {
+        if (validTool != null) {
+            results.push({ tool: validTool, extensions: toolToExts[validTool] });
+        }
+    }
+    return results;
+}
+async function _createNewFile(e) {
+    // TODO: support spaces
+    var toolExts = await _getToolsWithSkeletons(exports.platform.getDefaultExtensions());
+    var allExtensions;
+    var helpText;
+    if (toolExts.length === 0) {
+        allExtensions = exports.platform.getDefaultExtensions();
+        helpText = allExtensions.join(" ");
+    }
+    else {
+        allExtensions = toolExts.reduce((acc, te) => acc.concat(te.extensions), []);
+        helpText = toolExts.map(te => te.extensions.join(' ')).join("<br>");
+    }
+    bootbox.prompt({
+        title: "Enter the name of your new main source file.<br><br>" +
+            "<span class='dialog-help'>" + helpText + "</span>",
+        placeholder: "newfile" + allExtensions[0],
+        callback: (filename) => {
+            if (filename && filename.trim().length > 0) {
+                if (!checkEnteredFilename(filename))
+                    return;
+                if (filename.indexOf(".") < 0) {
+                    filename += allExtensions[0];
+                }
+                var path = filename;
+                exports.qs.newfile = '1';
+                reloadProject(path);
+            }
+        }
+    });
+    return true;
+}
+function _uploadNewFile(e) {
+    const uploadFileElem = $(`<input type="file" multiple accept="*" style="display:none">`);
+    const file = uploadFileElem[0];
+    uploadFileElem.change((e) => { handleFileUpload(file.files); });
+    uploadFileElem.click();
+}
+// called from index.html
+function handleFileUpload(files) {
+    console.log(files);
+    var index = 0;
+    function uploadNextFile() {
+        var f = files[index++];
+        if (!f) {
+            console.log("Done uploading", index);
+            if (index > 2) {
+                (0, dialogs_1.alertInfo)("Files uploaded.");
+                setTimeout(updateSelector, 1000); // TODO: wait for files to upload
+            }
+            else {
+                exports.qs.file = files[0].name;
+                bootbox.confirm({
+                    message: "Open '" + DOMPurify.sanitize(exports.qs.file) + "' as main project file?",
+                    buttons: {
+                        confirm: { label: "Open As New Project" },
+                        cancel: { label: "Include/Link With Project Later" },
+                    },
+                    callback: (result) => {
+                        if (result)
+                            gotoNewLocation();
+                        else
+                            setTimeout(updateSelector, 1000); // TODO: wait for files to upload
+                    }
+                });
+            }
+        }
+        else {
+            var path = f.name;
+            var reader = new FileReader();
+            reader.onload = function (e) {
+                var arrbuf = e.target.result;
+                var data = new Uint8Array(arrbuf);
+                // convert to UTF8, unless it's a binary file
+                if ((0, util_1.isProbablyBinary)(path, data)) {
+                    //gotoMainFile = false;
+                }
+                else {
+                    data = (0, util_1.byteArrayToUTF8)(data).replace('\r\n', '\n'); // convert CRLF to LF
+                }
+                // store in local forage
+                exports.projectWindows.updateFile(path, data);
+                console.log("Uploaded " + path + " " + data.length + " bytes");
+                uploadNextFile();
+            };
+            reader.readAsArrayBuffer(f); // read as binary
+        }
+    }
+    if (files)
+        uploadNextFile();
+}
+async function _openLocalDirectory(e) {
+    var pickerfn = window['showDirectoryPicker'];
+    if (!pickerfn) {
+        (0, dialogs_1.alertError)(`This browser can't open local files on your computer, yet. Try Chrome.`);
+    }
+    var dirHandle = await pickerfn();
+    var repoid = dirHandle.name;
+    var storekey = '__localfs__' + repoid;
+    var fsdata = {
+        handle: dirHandle,
+    };
+    var lstore = localforage.createInstance({
+        name: storekey,
+        version: 2.0
+    });
+    await lstore.setItem(storekey, fsdata);
+    exports.qs = { localfs: repoid };
+    gotoNewLocation(true);
+}
+async function promptUser(message) {
+    return new Promise((resolve, reject) => {
+        bootbox.prompt(DOMPurify.sanitize(message), (result) => {
+            resolve(result);
+        });
+    });
+}
+async function getLocalFilesystem(repoid) {
+    const options = { mode: 'readwrite' };
+    var storekey = '__localfs__' + repoid;
+    var lstore = localforage.createInstance({
+        name: storekey,
+        version: 2.0
+    });
+    var fsdata = await lstore.getItem(storekey);
+    var dirHandle = fsdata.handle;
+    console.log(fsdata, dirHandle);
+    var granted = await dirHandle.queryPermission(options);
+    console.log(granted);
+    if (granted !== 'granted') {
+        await promptUser(`Request permissions to access filesystem?`);
+        granted = await dirHandle.requestPermission(options);
+    }
+    if (granted !== 'granted') {
+        (0, dialogs_1.alertError)(`Could not get permission to access filesystem.`);
+        return;
+    }
+    const lastWriteTime = {};
+    return {
+        getFileData: async (path) => {
+            console.log('getFileData', path);
+            let fileHandle = await dirHandle.getFileHandle(path, { create: false });
+            let file = await fileHandle.getFile();
+            // always read bytes, then sniff the content -- the extension alone can't
+            // tell a binary resource (e.g. .vgr3) from text
+            return (0, util_1.bytesToFileData)(path, new Uint8Array(await file.arrayBuffer()));
+        },
+        setFileData: async (path, data) => {
+            lastWriteTime[path] = Date.now();
+            const fileHandle = await dirHandle.getFileHandle(path, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(data);
+            await writable.close();
+        },
+        onFileSystemUpdate: (callback) => {
+            // Experimental API:
+            // https://developer.mozilla.org/docs/Web/API/FileSystemObserver
+            if (typeof window.FileSystemObserver === 'undefined') {
+                return;
+            }
+            const observer = new window.FileSystemObserver((records, observer) => {
+                for (const record of records) {
+                    // TODO Handle different types of changes intelligently.
+                    // https://developer.mozilla.org/docs/Web/API/FileSystemChangeRecord#type
+                    if (record.changedHandle) {
+                        const path = record.changedHandle.name;
+                        // Ignore filesystem notifications that are likely from our own recent writes,
+                        // so that onFileChanged in ui.ts doesn't call assets editor's refresh(true).
+                        // TODO: Consider better options than a time based threshold.
+                        if (Date.now() - (lastWriteTime[path] || 0) < 2000)
+                            continue;
+                        callback(path);
+                    }
+                }
+            });
+            observer.observe(dirHandle, { recursive: true });
+        }
+    };
+}
+function getCurrentMainFilename() {
+    return (0, util_1.getFilenameForPath)(exports.current_project.mainPath);
+}
+function getCurrentEditorFilename() {
+    return (0, util_1.getFilenameForPath)(exports.projectWindows.getActiveID());
+}
+function _revertFile(e) {
+    var wnd = exports.projectWindows.getActive();
+    var fn = exports.projectWindows.getActiveID();
+    var isBinary = wnd && wnd.setData && !wnd.setText;
+    if (wnd && (wnd.setText || wnd.setData)) {
+        var url = "presets/" + (0, util_1.getBasePlatform)(exports.platform_id) + "/" + fn;
+        (0, util_1.getWithBinary)(url, (data) => {
+            if (data == null) {
+                if (exports.repo_id)
+                    (0, dialogs_1.alertError)("Can only revert built-in examples. If you want to revert all files, You can pull from the repository.");
+                else
+                    (0, dialogs_1.alertError)("Can only revert built-in examples.");
+                return;
+            }
+            bootbox.confirm("Reset '" + DOMPurify.sanitize(fn) + "' to default?", (ok) => {
+                if (ok) {
+                    if (isBinary) {
+                        wnd.setData(data);
+                        exports.current_project.updateFile(fn, data);
+                    }
+                    else {
+                        wnd.setText(data);
+                    }
+                }
+            });
+        }, isBinary ? 'arraybuffer' : 'text');
+    }
+    else {
+        (0, dialogs_1.alertError)("Cannot revert the active window. Please choose a text file.");
+    }
+}
+function _deleteFile(e) {
+    var wnd = exports.projectWindows.getActive();
+    if (wnd && wnd.getPath) {
+        var fn = exports.projectWindows.getActiveID();
+        bootbox.confirm("Delete '" + DOMPurify.sanitize(fn) + "'?", (ok) => {
+            if (ok) {
+                store.removeItem(fn).then(() => {
+                    // if we delete what is selected
+                    if (exports.qs.file == fn) {
+                        userPrefs.unsetLastPreset();
+                        gotoNewLocation();
+                    }
+                    else {
+                        updateSelector();
+                        (0, dialogs_1.alertInfo)("Deleted " + fn);
+                    }
+                });
+            }
+        });
+    }
+    else {
+        (0, dialogs_1.alertError)("Cannot delete the active window.");
+    }
+}
+function _renameFile(e) {
+    var wnd = exports.projectWindows.getActive();
+    if (wnd && wnd.getPath && exports.current_project.getFile(wnd.getPath())) {
+        var fn = exports.projectWindows.getActiveID();
+        bootbox.prompt({
+            title: "Rename '" + DOMPurify.sanitize(fn) + "' to?",
+            value: fn,
+            callback: (newfn) => {
+                var data = exports.current_project.getFile(wnd.getPath());
+                if (newfn && newfn != fn && data) {
+                    if (!checkEnteredFilename(newfn))
+                        return;
+                    store.removeItem(fn).then(() => {
+                        return store.setItem(newfn, data);
+                    }).then(() => {
+                        updateSelector();
+                        alert("Renamed " + fn + " to " + newfn); // need alert() so it pauses
+                        if (fn == exports.current_project.mainPath) {
+                            reloadProject(newfn);
+                        }
+                    });
+                }
+            }
+        });
+    }
+    else {
+        (0, dialogs_1.alertError)("Cannot rename the active window.");
+    }
+}
+function populateExamples(sel, filter, groupLabel) {
+    let files = {};
+    let optgroup;
+    const PRESETS = exports.platform.getPresets ? exports.platform.getPresets() : [];
+    for (var i = 0; i < PRESETS.length; i++) {
+        var preset = PRESETS[i];
+        if (filter != presetfilter_1.PRESET_FILTER_ALL && preset.category != filter)
+            continue;
+        var name = preset.chapter ? (preset.chapter + ". " + preset.name) : preset.name;
+        var isCurrentPreset = preset.id == exports.current_project.mainPath;
+        if (groupLabel) {
+            // a filter shows one group, labelled with the filter
+            if (!optgroup)
+                optgroup = $("<optgroup />").attr('label', groupLabel).appendTo(sel);
+        }
+        else if (preset.category) {
+            optgroup = $("<optgroup />").attr('label', 'Examples: ' + preset.category).appendTo(sel);
+        }
+        else if (!optgroup) {
+            optgroup = $("<optgroup />").attr('label', 'Examples').appendTo(sel);
+        }
+        optgroup.append($("<option />").val(preset.id).text(name).attr('selected', isCurrentPreset ? 'selected' : null));
+        if (isCurrentPreset)
+            current_preset = preset;
+        files[preset.id] = name;
+    }
+    return files;
+}
+function getPlatformRepos() {
+    const repos = [];
+    if (hasLocalStorage && !isElectron) {
+        var allrepos = (0, services_1.getRepos)();
+        if (allrepos) {
+            for (let repopath in allrepos) {
+                var repo = allrepos[repopath];
+                if (repo.platform_id && (0, util_1.getBasePlatform)(repo.platform_id) == (0, util_1.getBasePlatform)(exports.platform_id)) {
+                    repos.push({ id: repo.url, label: repo.url.substring(repo.url.indexOf('/')) });
+                }
+            }
+        }
+    }
+    return repos;
+}
+function populateRepos(sel, repos, label) {
+    if (repos.length) {
+        let optgroup = $("<optgroup />").attr('label', label).appendTo(sel);
+        for (const repo of repos) {
+            optgroup.append($("<option />").val(repo.id).text(repo.label));
+        }
+    }
+}
+function populateFiles(sel, keys, category, prefix, foundFiles) {
+    let optgroup;
+    for (var i = 0; i < keys.length; i++) {
+        let key = keys[i];
+        if (key.startsWith(prefix) && !foundFiles[key]) {
+            if (!optgroup)
+                optgroup = $("<optgroup />").attr('label', category).appendTo(sel);
+            let name = key.substring(prefix.length);
+            optgroup.append($("<option />").val(key).text(name).attr('selected', (key == exports.current_project.mainPath) ? 'selected' : null));
+        }
+    }
+}
+function finishSelector(sel) {
+    sel.css('visibility', 'visible');
+    // create option if not selected
+    var main = exports.current_project.mainPath;
+    if (sel.val() != main) {
+        sel.append($("<option />").val(main).text(main).attr('selected', 'selected'));
+    }
+}
+// Keep in step with the filter menu's hidden-md/hidden-sm/hidden-xs classes in
+// index.html: the menu is only there on very large screens.
+const PRESET_FILTER_MIN_WIDTH = 1200;
+function isPresetFilterAvailable() {
+    return typeof window === 'undefined' || !window.matchMedia
+        || window.matchMedia('(min-width:' + PRESET_FILTER_MIN_WIDTH + 'px)').matches;
+}
+function updatePresetFilterMenu(filters, selected) {
+    const menu = $("#preset_filter_menu");
+    const button = $("#presetFilterButton");
+    if (filters.length <= 1) {
+        menu.hide();
+        button.removeClass("filtering");
+        return;
+    }
+    menu.show();
+    const filtering = selected != presetfilter_1.PRESET_FILTER_ALL;
+    button.toggleClass("filtering", filtering)
+        .attr('title', filtering ? 'Filter Projects (Filtering by ' + (0, presetfilter_1.getPresetFilterLabel)(filters, selected) + ')' : 'Filter Projects');
+    const ul = $("#presetFilterList").empty();
+    for (const filter of filters) {
+        const link = $('<a class="dropdown-item" href="javascript:void(0)">')
+            .text(filter.label)
+            .attr('data-preset-filter', filter.key)
+            .on('click', (e) => {
+            e.preventDefault();
+            selectPresetFilter(filter.key);
+        });
+        if (filter.key == selected)
+            link.addClass("dropdown-item-checked");
+        ul.append($('<li>').append(link));
+    }
+}
+function selectPresetFilter(key) {
+    selectedPresetFilter = key;
+    userPrefs.setPresetFilter(key);
+    updateSelector();
+}
+async function updateSelector() {
+    var sel = $("#preset_select").empty();
+    const PRESETS = exports.platform.getPresets ? exports.platform.getPresets() : [];
+    current_preset = PRESETS.find(preset => preset.id == exports.current_project.mainPath);
+    if (!exports.repo_id) {
+        // normal: populate repos, examples, and local files, narrowed by the filter menu
+        const presetIds = new Set(PRESETS.map(preset => preset.id));
+        let keys = await store.keys();
+        if (!keys)
+            keys = [];
+        const localFiles = keys.filter(key => !presetIds.has(key));
+        const repos = getPlatformRepos();
+        if (selectedPresetFilter == null)
+            selectedPresetFilter = userPrefs.getPresetFilter();
+        let filter = presetfilter_1.PRESET_FILTER_ALL;
+        let filterLabel = "All";
+        if (isPresetFilterAvailable()) {
+            const filters = (0, presetfilter_1.getPresetFilters)(PRESETS, localFiles.length > 0, repos.length > 0);
+            selectedPresetFilter = (0, presetfilter_1.resolvePresetFilter)(filters, selectedPresetFilter);
+            updatePresetFilterMenu(filters, selectedPresetFilter);
+            filter = selectedPresetFilter;
+            filterLabel = (0, presetfilter_1.getPresetFilterLabel)(filters, filter);
+        }
+        else {
+            // the filter menu is hidden here, so don't narrow the picker by an
+            // invisible filter
+            $("#preset_filter_menu").hide();
+        }
+        // when a filter is on, the picker's option list says so at the top
+        const groupLabel = filter == presetfilter_1.PRESET_FILTER_ALL ? null : 'Filtering by category "' + filterLabel + '"';
+        const all = filter == presetfilter_1.PRESET_FILTER_ALL;
+        if (all || filter == presetfilter_1.PRESET_FILTER_REPOSITORIES) {
+            populateRepos(sel, repos, groupLabel || 'Repositories');
+        }
+        let foundFiles = {};
+        if (all || PRESETS.some(preset => preset.category == filter)) {
+            foundFiles = populateExamples(sel, filter, groupLabel);
+        }
+        if (all || filter == presetfilter_1.PRESET_FILTER_LOCAL_FILES) {
+            populateFiles(sel, localFiles, groupLabel || "Local Files", "", foundFiles);
+        }
+        finishSelector(sel);
+    }
+    else {
+        $("#preset_filter_menu").hide();
+        sel.append($("<option />").val('/').text('Leave Repository'));
+        $("#repo_name").text((0, util_1.getFilenameForPath)(exports.repo_id) + '/').show();
+        // repo: populate all files
+        await populateFiles(sel, (await store.keys()) || [], exports.repo_id, "", {});
+        finishSelector(sel);
+    }
+    // set click handlers
+    sel.off('change').change(function (e) {
+        reloadProject($(this).val().toString());
+    });
+}
+function getErrorElement(err) {
+    var span = $('<p/>');
+    if (err.path != null) {
+        var s = err.line ? err.label ? `(${err.path} @ ${err.label})` : `(${err.path}:${err.line})` : `(${err.path})`;
+        var link = $('<a/>').text(s);
+        var path = err.path;
+        // TODO: hack because examples/foo.a only gets listed as foo.a
+        if (path == getCurrentMainFilename())
+            path = exports.current_project.mainPath;
+        // click link to open file, if it's available...
+        if (exports.projectWindows.isWindow(path)) {
+            link.click((ev) => {
+                var wnd = exports.projectWindows.createOrShow(path);
+                if (wnd instanceof editors_1.SourceEditor) {
+                    wnd.navigateToLine(err.line);
+                }
+            });
+        }
+        span.append(link);
+        span.append('&nbsp;');
+    }
+    var msg = $('<span/>');
+    (0, errormarkup_1.appendErrorText)(msg[0], err.msg);
+    span.append(msg);
+    (0, errormarkup_1.appendErrorHelp)(span[0], err.help, err.topic);
+    return span;
+}
+function hideErrorAlerts() {
+    $("#error_alert").hide();
+    errorWasRuntime = false;
+}
+function showErrorAlert(errors, runtime) {
+    var div = $("#error_alert_msg").empty();
+    for (var err of errors.slice(0, 10)) {
+        div.append(getErrorElement(err));
+    }
+    $("#error_alert").show();
+    errorWasRuntime = runtime;
+    // status chip: click jumps to first error that has an openable path
+    var jumpErr = errors.find((err) => err.path != null);
+    var fn;
+    if (jumpErr && exports.projectWindows.isWindow(jumpErr.path == getCurrentMainFilename() ? exports.current_project.mainPath : jumpErr.path)) {
+        fn = () => { jumpToError(jumpErr); };
+    }
+}
+function showExceptionAsError(err, msg) {
+    if (msg != null) {
+        var werr = { msg: msg, line: 0 };
+        if (err instanceof emu_1.EmuHalt && err.$loc) {
+            werr = Object.create(err.$loc);
+            werr.msg = msg;
+            console.log(werr);
+        }
+        showErrorAlert([werr], true);
+    }
+}
+// warnings of the build that made the current output, kept for unchanged rebuilds
+var lastWarnings = null;
+async function setCompileOutput(data) {
+    if ('uppercaseOnly' in data) {
+        (0, editors_1.setUppercaseOnly)(data.uppercaseOnly);
+    }
+    // errors? mark them in editor
+    if ('errors' in data && data.errors.length > 0) {
+        toolbar.addClass("has-errors");
+        exports.projectWindows.setErrors(data.errors);
+        refreshWindowList(); // to make sure windows are created for showErrorAlert()
+        // warnings only get gutter markers; a tool that failed with nothing but warnings still shows them
+        showErrorAlert((0, listingutils_1.hasErrors)(data.errors) ? data.errors.filter((e) => e.severity !== 'warning') : data.errors, false);
+    }
+    else {
+        toolbar.removeClass("has-errors"); // may be added in next callback
+        exports.projectWindows.setErrors(null);
+        hideErrorAlerts();
+        // exit if compile output unchanged; its warnings still apply
+        if (data == null || ('unchanged' in data && data.unchanged)) {
+            if (lastWarnings)
+                exports.projectWindows.setErrors(lastWarnings);
+            return;
+        }
+        // make sure it's a WorkerOutputResult
+        if (!('output' in data))
+            return;
+        // warnings don't fail the build: mark them in the editor, without the alert
+        lastWarnings = data.warnings && data.warnings.length > 0 ? data.warnings : null;
+        if (lastWarnings)
+            exports.projectWindows.setErrors(lastWarnings);
+        // process symbol map
+        exports.platform.debugSymbols = new baseplatform_1.DebugSymbols(data.symbolmap, data.debuginfo, data.symbolsizes);
+        compparams = data.params;
+        // load ROM
+        var rom = data.output;
+        if (rom != null) {
+            if (current_output && (0, util_1.arrayCompare)(rom, current_output)) {
+                console.log("unchanged, skipping loadROM");
+            }
+            else {
+                try {
+                    clearBreakpoint(); // so we can replace memory (TODO: change toolbar btn)
+                    _resetRecording();
+                    await exports.platform.loadROM(getCurrentPresetTitle(), rom, data.origin);
+                    current_output = rom;
+                    // re-arm breakpoints before the new ROM gets to run: clearBreakpoint()
+                    // above disarmed them, and code that only runs at startup (main() on the
+                    // C64, say) would race past them before anything else re-armed
+                    if (!userPaused) {
+                        if (breakpoints_1.bpStore.getEnabled().length == 0 || !armBreakpoints())
+                            _resume();
+                    }
+                    writeOutputROMFile();
+                }
+                catch (e) {
+                    console.log(e);
+                    toolbar.addClass("has-errors");
+                    showExceptionAsError(e, e + "");
+                    current_output = null;
+                    refreshWindowList();
+                    return;
+                }
+            }
+        }
+        // update all windows (listings)
+        refreshWindowList();
+        exports.projectWindows.refresh(false);
+        // updating a listing clears the editor's markers, so mark the warnings again
+        exports.projectWindows.refreshErrors();
+    }
+}
+async function loadBIOSFromProject() {
+    if (exports.platform.loadBIOS) {
+        var biospath = exports.platform_id + '.rom';
+        var biosdata = await store.getItem(biospath);
+        if (biosdata != null && biosdata instanceof Uint8Array) {
+            console.log('loading BIOS', biospath, biosdata.length + " bytes");
+            try {
+                exports.platform.loadBIOS(biospath, biosdata);
+            }
+            catch (e) {
+                // A bad BIOS file must not lock us out of the IDE (and its file manager):
+                // the platform keeps running with its built-in BIOS, so we warn and go on.
+                console.log(e);
+                (0, dialogs_1.alertError)(`Could not load BIOS file "${biospath}": ${e.message || e + ''}<br><br>` +
+                    'The emulator will use its built-in BIOS. Delete or rename the file to fix this.');
+            }
+        }
+        else {
+            console.log('BIOS file must be binary');
+        }
+    }
+}
+function hideDebugInfo() {
+    var meminfo = $("#mem_info");
+    meminfo.hide();
+    lastDebugInfo = null;
+}
+function showDebugInfo(state) {
+    if (!(0, baseplatform_1.isDebuggable)(exports.platform))
+        return;
+    var meminfo = $("#mem_info");
+    var meminfomsg = $("#mem_info_msg");
+    var allcats = exports.platform.getDebugCategories();
+    if (allcats && !debugCategory)
+        debugCategory = allcats[0];
+    var s = state && exports.platform.getDebugInfo(debugCategory, state);
+    if (typeof s === 'string') {
+        var hs = lastDebugInfo ? (0, util_1.highlightDifferences)(lastDebugInfo, s) : s;
+        meminfo.show();
+        meminfomsg.html(hs);
+        var catspan = $('<div class="mem_info_links">');
+        var addCategoryLink = (cat) => {
+            var catlink = $('<a>' + cat + '</a>');
+            if (cat == debugCategory)
+                catlink.addClass('selected');
+            catlink.click((e) => {
+                debugCategory = cat;
+                lastDebugInfo = null;
+                showDebugInfo(exports.lastDebugState);
+            });
+            catspan.append(catlink);
+            catspan.append('<span> </span>');
+        };
+        for (var cat of allcats) {
+            addCategoryLink(cat);
+        }
+        meminfomsg.append('<br>');
+        meminfomsg.append(catspan);
+        lastDebugInfo = s;
+    }
+    else {
+        hideDebugInfo();
+    }
+}
+function setDebugButtonState(btnid, btnstate) {
+    $("#debug_bar, #run_bar").find("button").removeClass("btn_active").removeClass("btn_stopped");
+    $("#dbg_" + btnid).addClass("btn_" + btnstate);
+    (0, shortcutbar_1.refreshShortcutBar)();
+}
+// context-sensitive shortcut providers for the bottom bar
+function jumpToError(err) {
+    var path = err.path == getCurrentMainFilename() ? exports.current_project.mainPath : err.path;
+    if (!exports.projectWindows.isWindow(path))
+        return;
+    var wnd = exports.projectWindows.createOrShow(path);
+    if (wnd instanceof editors_1.SourceEditor) {
+        wnd.navigateToLine(err.line);
+    }
+}
+// go-to-address (mod+shift+g): works while the Disassembly, Memory Browser,
+// or VRAM Browser is the active view; accepts a hex address ("$1234", "0x1234",
+// "1234") or a symbol name ("main")
+function getGoToAddressView() {
+    var wnd = exports.projectWindows.getActive();
+    if (wnd instanceof editors_1.DisassemblerView || wnd instanceof debugviews_1.MemoryView)
+        return wnd;
+    return null;
+}
+function parseGoToTarget(s) {
+    var target = (0, debuggerhit_1.resolveDebuggerTarget)(s, exports.platform && exports.platform.debugSymbols && exports.platform.debugSymbols.symbolmap);
+    return target ? target.addr : -1;
+}
+function promptGoToAddress() {
+    var wnd = getGoToAddressView();
+    if (!wnd)
+        return false;
+    var cur = wnd.getCursorPC ? wnd.getCursorPC() : -1;
+    bootbox.prompt({
+        title: "Go to Address",
+        placeholder: "address in hex",
+        value: cur >= 0 ? (0, util_1.hex)(cur, 4) : "",
+        callback: (result) => {
+            if (!result)
+                return; // canceled or empty
+            var addr = parseGoToTarget(result);
+            if (isNaN(addr) || addr < 0) {
+                (0, dialogs_1.alertError)("Can't find address or symbol: " + DOMPurify.sanitize(result));
+                return;
+            }
+            wnd.goToAddress(addr);
+        }
+    });
+    return true;
+}
+function getGlobalShortcuts() {
+    var shortcuts = [];
+    if (exports.platform && isPlatformReady()) {
+        shortcuts.push({ key: 'F1', label: 'Help', fn: showContextHelp });
+        // single-key pause/resume toggle (works while the editor is focused);
+        // mod+shift+h / mod+shift+g still work outside the editor.
+        // pushed first so its position doesn't shift when other chips come and
+        // go as the debug session starts
+        if (exports.platform.isRunning) {
+            shortcuts.push({ key: 'F8', label: exports.platform.isRunning() ? 'Pause' : 'Resume', fn: togglePauseResume });
+        }
+        // debug shortcuts appear only once a debug session has started
+        if (exports.platform.setupDebug && exports.platform.runEval) // TODO??
+            shortcuts.push({ key: 'mod+shift+d', label: 'Reset & Break', fn: resetAndDebug });
+        if (!debugSessionActive) {
+            shortcuts.push({ key: 'mod+shift+r', label: 'Reset & Run', fn: resetAndRun });
+            shortcuts.push({ key: 'mod+shift+f', label: 'Search', fn: searchview_1.openSearchDialog });
+        }
+        if (getGoToAddressView()) {
+            // mod+shift+g becomes "Go To Address" while a debug tool view is active
+            shortcuts.push({ key: 'mod+shift+g', label: 'Go To Address', fn: promptGoToAddress });
+        }
+    }
+    return shortcuts;
+}
+function getDebugShortcuts() {
+    var shortcuts = [];
+    if (!debugSessionActive || !exports.platform || !isPlatformReady())
+        return shortcuts;
+    var running = exports.platform.isRunning && exports.platform.isRunning();
+    if (exports.platform.step)
+        shortcuts.push({ key: 'mod+shift+l', label: 'Step', fn: singleStep });
+    if (exports.platform.stepOver)
+        shortcuts.push({ key: 'mod+shift+k', label: 'Step Over', fn: stepOver });
+    if (exports.platform.runUntilReturn)
+        shortcuts.push({ key: 'mod+shift+i', label: 'Step Out', fn: runUntilReturn });
+    if (exports.platform.stepBack)
+        shortcuts.push({ key: 'mod+shift+j', label: 'Step Back', fn: runStepBackwards });
+    if (exports.platform.runToVsync)
+        shortcuts.push({ key: 'mod+shift+x', label: 'Next Frame', fn: singleFrameStep });
+    if (exports.platform.restartAtPC)
+        shortcuts.push({ key: 'mod+shift+a', label: 'Restart at Cursor', fn: restartAtCursor });
+    // TODO: check to see if line has debug info
+    if ((exports.platform.runEval || exports.platform.runToPC) && !exports.platform_id.startsWith('verilog'))
+        shortcuts.push({ key: 'mod+shift+y', label: 'Run To Line', fn: runToCursor });
+    // session-level actions are always available once debugging
+    //shortcuts.push({ key: 'mod+shift+e', label: recorderActive ? 'Stop Recording' : 'Record', fn: _toggleRecording });
+    return shortcuts;
+}
+function isPlatformReady() {
+    return exports.platform && current_output != null;
+}
+function checkRunReady() {
+    if (!isPlatformReady()) {
+        (0, dialogs_1.alertError)("Can't do this until build successfully completes.");
+        return false;
+    }
+    else
+        return true;
+}
+// find the best known listing window + source line for a PC value, among
+// listings with a window we can show (see ProjectWindows.isWindow -- this
+// just means "known window id", not "currently open"). Pure logic lives in
+// listinglocation.ts (unit tested); this just wires up the live IDE state.
+function findListingLocation(pc) {
+    return (0, listinglocation_1.findListingLocation)(pc, {
+        listings: exports.current_project.getListings(),
+        filename2path: exports.current_project.filename2path,
+        isWindow: (id) => exports.projectWindows.isWindow(id),
+        findWindowWithFilePrefix: (fn) => exports.projectWindows.findWindowWithFilePrefix(fn),
+        headerWindowFor: headerWindowForListing,
+        symbolAddrs: exports.platform.debugSymbols && exports.platform.debugSymbols.symbolAddrs,
+    }, editors_1.PC_LINE_LOOKAHEAD);
+}
+// true while the active stop request is a breakpoint run (see armBreakpoints)
+var stoppingAtBreakpoint = false;
+function openRelevantListing(state) {
+    // a breakpoint hit always shows its location, whatever view is open
+    if (!stoppingAtBreakpoint) {
+        // if we clicked on a specific tool, don't switch windows
+        if (lastViewClicked && lastViewClicked.startsWith('#'))
+            return;
+        // don't switch windows for specific debug commands
+        if (['toline', 'restart', 'tovsync', 'stepover'].includes(lastDebugCommand))
+            return;
+    }
+    // has to support disassembly, at least
+    if (!exports.platform.disassemble)
+        return;
+    let pc = state.c ? (state.c.EPC || state.c.PC) : 0;
+    // a hit on a source breakpoint goes to the file/line it was set on (window
+    // ids for source files are plain paths, e.g. the main file has no '#')
+    if (stoppingAtBreakpoint) {
+        let hit = (0, breakpoints_1.resolveBreakpoints)().find(r => r.bp.enabled && r.bp.type == 'source' && r.pc == pc && exports.projectWindows.isWindow(r.bp.file));
+        if (hit) {
+            let wnd = exports.projectWindows.createOrShow(hit.bp.file, true);
+            if (wnd instanceof editors_1.SourceEditor)
+                wnd.highlightLines(hit.bp.line - 1, hit.bp.line - 1);
+            return;
+        }
+    }
+    let best = findListingLocation(pc);
+    // if no appropriate listing found, use disassembly view
+    exports.projectWindows.createOrShow(best ? best.wndid : "#disasm", true);
+}
+// jump to (and highlight) the best known source line for an address --
+// e.g. for a symbol/address breakpoint, which has no stored file/line of
+// its own. Falls back to the disassembly view if no source line resolves.
+function openLocationForPC(pc) {
+    if (!exports.platform.disassemble)
+        return;
+    let best = findListingLocation(pc);
+    let wnd = exports.projectWindows.createOrShow(best ? best.wndid : "#disasm", true);
+    if (best && wnd instanceof editors_1.SourceEditor) {
+        wnd.highlightLines(best.line - 1, best.line - 1);
+    }
+    else if (wnd instanceof editors_1.DisassemblerView) {
+        wnd.goToAddress(pc);
+    }
+}
+function uiDebugCallback(state) {
+    debugSessionActive = true;
+    exports.lastDebugState = state;
+    showDebugInfo(state);
+    openRelevantListing(state);
+    exports.projectWindows.refresh(true); // move cursor
+    debugTickPaused = true;
+}
+function setupDebugCallback(btnid) {
+    if (exports.platform.setupDebug) {
+        exports.platform.setupDebug((state, msg) => {
+            uiDebugCallback(state);
+            setDebugButtonState(btnid || "pause", "stopped");
+            msg && showErrorAlert([{ msg: "STOPPED: " + msg, line: 0 }], true);
+        });
+        lastDebugCommand = btnid;
+    }
+}
+function setupBreakpoint(btnid) {
+    if (!checkRunReady())
+        return;
+    stoppingAtBreakpoint = false;
+    debugSessionActive = true;
+    _disableRecording();
+    setupDebugCallback(btnid);
+    if (btnid)
+        setDebugButtonState(btnid, "active");
+    (0, shortcutbar_1.refreshShortcutBar)();
+}
+function _pause() {
+    debugSessionActive = true;
+    if (exports.platform && exports.platform.isRunning()) {
+        exports.platform.pause();
+        console.log("Paused");
+    }
+    setDebugButtonState("pause", "stopped");
+}
+function pause() {
+    if (!checkRunReady())
+        return;
+    clearBreakpoint();
+    _pause();
+    userPaused = true;
+    (0, shortcutbar_1.refreshShortcutBar)(); // debug chips appear once the session starts
+}
+// F8 pauses a running emulator and resumes a paused one. Unmodified and not
+// bound by CodeMirror, so it always reaches the IDE -- even while typing in
+// the editor, where mod+shift+g stays find-next/previous.
+function togglePauseResume() {
+    if (!checkRunReady())
+        return;
+    if (exports.platform.isRunning && exports.platform.isRunning())
+        pause();
+    else
+        resume();
+}
+function _resume() {
+    if (!exports.platform.isRunning()) {
+        exports.platform.resume();
+        console.log("Resumed");
+    }
+    setDebugButtonState("go", "active");
+    if (errorWasRuntime) {
+        hideErrorAlerts();
+    }
+}
+function resume() {
+    if (!checkRunReady())
+        return;
+    // If there are enabled breakpoints, resume with them armed; the debug
+    // session stays active so the debug chips keep showing
+    if (breakpoints_1.bpStore.getEnabled().length > 0 && armBreakpoints()) {
+        if (!exports.platform.isRunning()) {
+            exports.projectWindows.refresh(false);
+        }
+        userPaused = false;
+        lastViewClicked = null;
+        return;
+    }
+    clearBreakpoint();
+    // plain run: end the debug session so the Reset & Run / Search chips return
+    // (pause() set debugSessionActive; undo it here unless breakpoints were armed)
+    debugSessionActive = false;
+    if (!exports.platform.isRunning()) {
+        exports.projectWindows.refresh(false);
+    }
+    _resume();
+    userPaused = false;
+    lastViewClicked = null;
+    (0, shortcutbar_1.refreshShortcutBar)();
+}
+function singleStep() {
+    if (!checkRunReady())
+        return;
+    setupBreakpoint("step");
+    exports.platform.step();
+}
+function stepOver() {
+    if (!checkRunReady())
+        return;
+    setupBreakpoint("stepover");
+    // platform-specific step-over (e.g. BASIC statements) takes precedence
+    if (exports.platform.hasCustomStepOver && exports.platform.hasCustomStepOver()) {
+        exports.platform.stepOver();
+        return;
+    }
+    // source-level stepping: break at the first PC assigned to a source line,
+    // unless we're in the disassembly view -- then assume no line info
+    if (exports.projectWindows.getActiveID() != '#disasm') {
+        var pcs = getSourceLineStartPCs();
+        if (pcs.size > 0 && stepOverSource(pcs)) {
+            return;
+        }
+    }
+    // fall back to instruction-level step-over
+    if (exports.platform.stepOver) {
+        exports.platform.stepOver();
+    }
+    else {
+        exports.platform.step();
+    }
+}
+var sourcePcsCache = null;
+// build set of all PCs that begin a source line; cached until next build
+function getSourceLineStartPCs() {
+    var listings = exports.current_project.getListings();
+    if (!sourcePcsCache || sourcePcsCache.listings !== listings) {
+        sourcePcsCache = { listings: listings, pcs: (0, projectcore_1.sourceLineStartPCs)(listings) };
+    }
+    return sourcePcsCache.pcs;
+}
+// source-level step over: break at the next line-start PC, but skip over any
+// subroutine call made by the current instruction (and interrupts it triggers).
+// returns false if source-level stepping isn't possible here.
+function stepOverSource(pcs) {
+    var _a;
+    if (!exports.platform.runEval || !exports.lastDebugState || !exports.lastDebugState.c)
+        return false;
+    var pc = exports.lastDebugState.c.EPC || exports.lastDebugState.c.PC;
+    var sp0 = exports.platform.getSP ? exports.platform.getSP() : null;
+    // if current instruction is a subroutine call, don't stop inside it
+    var iscall = false;
+    var readfn = (_a = exports.platform.readAddress) === null || _a === void 0 ? void 0 : _a.bind(exports.platform);
+    if (readfn && exports.platform.disassemble) {
+        var d = exports.platform.disassemble(pc, readfn);
+        iscall = !!(d && d.iscall);
+    }
+    exports.platform.runEval((c) => {
+        var cur = c.EPC || c.PC;
+        if (cur == pc)
+            return false; // haven't left this instruction yet
+        if (iscall && sp0 != null && c.SP < sp0)
+            return false; // inside called subroutine (or IRQ)
+        return pcs.has(cur);
+    });
+    return true;
+}
+function singleFrameStep() {
+    if (!checkRunReady())
+        return;
+    setupBreakpoint("tovsync");
+    exports.platform.runToVsync();
+}
+function getEditorPC() {
+    var wnd = exports.projectWindows.getActive();
+    return wnd && wnd.getCursorPC && wnd.getCursorPC();
+}
+// Arm all enabled breakpoints from the shared store: break when the CPU
+// reaches any breakpoint location (and, for conditional breakpoints, when
+// its condition evaluates true). Returns true if anything was armed.
+function armBreakpoints() {
+    if (!checkRunReady())
+        return false;
+    const rbps = (0, breakpoints_1.resolveBreakpoints)().filter(r => r.bp.enabled && !r.error && r.pc >= 0);
+    if (rbps.length == 0)
+        return false;
+    exports.lastDebugState = null;
+    hideDebugInfo();
+    exports.projectWindows.refresh(false); // clear any "stopped here" highlight (e.g. Breakpoints window)
+    setupBreakpoint("toline");
+    stoppingAtBreakpoint = true;
+    const targets = new Map();
+    for (const r of rbps)
+        targets.set(r.pc, r.condFn || null);
+    if (exports.platform.runEvalAtPC) {
+        exports.platform.runEvalAtPC(targets);
+    }
+    else if (exports.platform.runToPC) {
+        // platform can't arm per-address conditions: break on locations, ignore conditions
+        if (rbps.some(r => r.condFn))
+            console.log("breakpoints: conditions not supported on this platform");
+        exports.platform.runToPC([...targets.keys()]);
+    }
+    else if (exports.platform.runEval) {
+        // platform has neither helper (e.g. vcs, which wraps its own emulator
+        // core's debug API directly) -- fall back to a hand-rolled matcher,
+        // same as the plain runToPC() function below does in this case
+        exports.platform.runEval((c) => {
+            const epc = c.EPC != null ? c.EPC : c.PC;
+            const cond = targets.get(epc);
+            return cond !== undefined && (cond ? cond(c) : true);
+        });
+    }
+    else {
+        return false;
+    }
+    return true;
+}
+// push store state into every open editor's gutter markers
+function syncEditorBreakpoints() {
+    for (var id in exports.projectWindows.id2window) {
+        var wnd = exports.projectWindows.id2window[id];
+        if (wnd instanceof editors_1.SourceEditor || wnd instanceof editors_1.HeaderView) {
+            try {
+                wnd.syncBreakpoints();
+            }
+            catch (e) { }
+        }
+    }
+}
+// single store listener: persist, sync UI, and re-arm while running
+// (mirrors the old gutter-toggle behavior)
+breakpoints_1.bpStore.subscribe(() => {
+    syncEditorBreakpoints();
+    if (exports.projectWindows.getActiveID() == '#breakpoints') {
+        exports.projectWindows.refresh(false);
+    }
+    if (isPlatformReady() && exports.platform.isRunning()) {
+        if (breakpoints_1.bpStore.getEnabled().length > 0) {
+            armBreakpoints();
+        }
+        else {
+            clearBreakpoint();
+        }
+    }
+});
+function runToPC(pc) {
+    if (!checkRunReady())
+        return;
+    if (pc.length === 0 || pc.some(p => !(p >= 0)))
+        return;
+    exports.lastDebugState = null;
+    hideDebugInfo();
+    exports.projectWindows.refresh(false);
+    setupBreakpoint("toline");
+    console.log("runToPC", pc.map(p => p.toString(16)).join(" "));
+    if (exports.platform.runToPC) {
+        exports.platform.runToPC(pc);
+    }
+    else {
+        const pcSet = new Set(pc);
+        exports.platform.runEval((c) => {
+            return pcSet.has(c.PC);
+        });
+    }
+}
+function restartAtCursor() {
+    if (exports.platform.restartAtPC(getEditorPC())) {
+        resume();
+    }
+    else
+        (0, dialogs_1.alertError)(`Could not restart program at selected line.`);
+}
+function runToCursor() {
+    runToPC([getEditorPC()]);
+}
+function runUntilReturn() {
+    if (!checkRunReady())
+        return;
+    setupBreakpoint("stepout");
+    exports.platform.runUntilReturn();
+}
+function runStepBackwards() {
+    if (!checkRunReady())
+        return;
+    setupBreakpoint("stepback");
+    exports.platform.stepBack();
+}
+function clearBreakpoint() {
+    exports.lastDebugState = null;
+    if (exports.platform.clearDebug)
+        exports.platform.clearDebug();
+    setupDebugCallback(); // in case of BRK/trap
+    showDebugInfo();
+}
+function resetPlatform() {
+    exports.platform.reset();
+    _resetRecording();
+    exports.projectWindows.resetViews();
+}
+function resetAndRun() {
+    if (!checkRunReady())
+        return;
+    clearBreakpoint();
+    resetPlatform();
+    // if there are enabled breakpoints, restart with them armed
+    if (breakpoints_1.bpStore.getEnabled().length > 0 && armBreakpoints()) {
+        debugSessionActive = true;
+    }
+    else {
+        debugSessionActive = false; // plain run: hide debug shortcut chips
+        exports.projectWindows.refresh(false); // clear any stale "stopped here" highlight
+        _resume();
+    }
+    (0, shortcutbar_1.refreshShortcutBar)();
+}
+function resetAndDebug() {
+    if (!checkRunReady())
+        return;
+    var wasRecording = recorderActive;
+    _disableRecording();
+    if (exports.platform.setupDebug && exports.platform.runEval) { // TODO??
+        clearBreakpoint();
+        _resume();
+        resetPlatform();
+        setupBreakpoint("restart");
+        exports.platform.runEval((c) => { return true; }); // break immediately
+    }
+    else {
+        resetPlatform();
+        _resume();
+    }
+    if (wasRecording)
+        _enableRecording();
+}
+function updateDebugWindows() {
+    if (exports.platform.isRunning()) {
+        exports.projectWindows.tick();
+        debugTickPaused = false;
+    }
+    else if (!debugTickPaused) { // final tick after pausing
+        exports.projectWindows.tick();
+        debugTickPaused = true;
+    }
+    setTimeout(updateDebugWindows, 100);
+}
+function setFrameRateUI(fps) {
+    exports.platform.setFrameRate(fps);
+    if (fps > 0.01)
+        $("#fps_label").text(fps.toFixed(2));
+    else
+        $("#fps_label").text("1/" + Math.round(1 / fps));
+}
+function _slowerFrameRate() {
+    var fps = exports.platform.getFrameRate();
+    fps = fps / 2;
+    if (fps > 0.00001)
+        setFrameRateUI(fps);
+}
+function _fasterFrameRate() {
+    var fps = exports.platform.getFrameRate();
+    fps = Math.min(60, fps * 2);
+    setFrameRateUI(fps);
+}
+function _slowestFrameRate() {
+    setFrameRateUI(60 / 65536);
+}
+function _fastestFrameRate() {
+    _resume();
+    setFrameRateUI(60);
+}
+function traceTiming() {
+    exports.projectWindows.refresh(false);
+    var wnd = exports.projectWindows.getActive();
+    if (wnd.getSourceFile && wnd.setTimingResult) { // is editor active?
+        var analyzer = exports.platform.newCodeAnalyzer();
+        analyzer.showLoopTimingForPC(0);
+        wnd.setTimingResult(analyzer);
+    }
+}
+function _disableRecording() {
+    if (recorderActive) {
+        exports.platform.setRecorder(null);
+        $("#dbg_record").removeClass("btn_recording");
+        $("#replaydiv").hide();
+        hideDebugInfo();
+        recorderActive = false;
+    }
+}
+function _resetRecording() {
+    if (recorderActive) {
+        stateRecorder.reset();
+    }
+}
+function _enableRecording() {
+    stateRecorder.reset();
+    exports.platform.setRecorder(stateRecorder);
+    $("#dbg_record").addClass("btn_recording");
+    $("#replaydiv").show();
+    recorderActive = true;
+}
+function _toggleRecording() {
+    if (recorderActive) {
+        _disableRecording();
+    }
+    else {
+        _enableRecording();
+    }
+    (0, shortcutbar_1.refreshShortcutBar)();
+}
+function _toggleTraceLines() {
+    var enabled = !editors_1.SourceEditor.tracingEnabled;
+    $("#dbg_tracelines").toggleClass("btn_active", enabled);
+    var wnd = exports.projectWindows.getActive();
+    if (wnd instanceof editors_1.SourceEditor) {
+        wnd.setTracingEnabled(enabled);
+    }
+    else {
+        editors_1.SourceEditor.tracingEnabled = enabled;
+    }
+}
+function addFileToProject(type, ext, linefn) {
+    var wnd = exports.projectWindows.getActive();
+    if (wnd && wnd.insertLinesBefore) {
+        bootbox.prompt({
+            title: "Add " + DOMPurify.sanitize(type) + " File to Project",
+            value: "filename" + DOMPurify.sanitize(ext),
+            callback: (filename) => {
+                if (filename && filename.trim().length > 0) {
+                    if (!checkEnteredFilename(filename))
+                        return;
+                    var path = filename;
+                    var newline = "\n" + linefn(filename) + "\n";
+                    exports.current_project.loadFiles([path]).then((result) => {
+                        if (result && result.length) {
+                            (0, dialogs_1.alertError)(filename + " already exists; including anyway");
+                        }
+                        else {
+                            exports.current_project.updateFile(path, "\n");
+                        }
+                        wnd.insertLinesBefore(newline);
+                        refreshWindowList();
+                    });
+                }
+            }
+        });
+    }
+    else {
+        (0, dialogs_1.alertError)("Can't insert text in this window -- switch back to main file");
+    }
+}
+// TODO: lwtools and smaller c
+function _addIncludeFile() {
+    var fn = getCurrentMainFilename();
+    var tool = exports.platform.getToolForFilename(fn);
+    // TODO: more tools? make this a function of the platform / tool provider
+    if (fn.endsWith(".c") || tool == 'sdcc' || tool == 'cc65' || tool == 'cmoc' || tool == 'smlrc' || tool == 'oscar64')
+        addFileToProject("Header", ".h", (s) => { return '#include "' + s + '"'; });
+    else if (tool == 'dasm' || tool == 'zmac')
+        addFileToProject("Include", ".inc", (s) => { return '\tinclude "' + s + '"'; });
+    else if (tool == 'ca65' || tool == 'sdasz80' || tool == 'vasm' || tool == 'armips')
+        addFileToProject("Include", ".inc", (s) => { return '\t.include "' + s + '"'; });
+    else if (tool == 'verilator')
+        addFileToProject("Verilog", ".v", (s) => { return '`include "' + s + '"'; });
+    else if (tool == 'wiz')
+        addFileToProject("Include", ".wiz", (s) => { return 'import "' + s + '";'; });
+    else if (tool == 'ecs')
+        addFileToProject("Include", ".ecs", (s) => { return 'import "' + s + '"'; });
+    else if (tool == 'acme')
+        addFileToProject("Include", ".acme", (s) => { return '!src "' + s + '"'; });
+    else if (tool == 'xa')
+        addFileToProject("Include", ".xa", (s) => { return '#include "' + s + '"'; });
+    else if (tool == 'dialog')
+        addFileToProject("Include", ".dg", (s) => { return '%% #include "' + s + '"'; });
+    else
+        (0, dialogs_1.alertError)("Can't add include file to this project type (" + tool + ")");
+}
+function _addLinkFile() {
+    var fn = getCurrentMainFilename();
+    var tool = exports.platform.getToolForFilename(fn);
+    if (fn.endsWith(".c") || tool == 'sdcc' || tool == 'cc65' || tool == 'cmoc' || tool == 'smlrc')
+        addFileToProject("Linked C (or .s)", ".c", (s) => { return '//#link "' + s + '"'; });
+    else if (fn.endsWith("asm") || fn.endsWith(".s") || tool == 'ca65' || tool == 'lwasm')
+        addFileToProject("Linked ASM", ".inc", (s) => { return ';#link "' + s + '"'; });
+    else
+        (0, dialogs_1.alertError)("Can't add linked file to this project type (" + tool + ")");
+}
+function setupDebugControls() {
+    // create toolbar buttons
+    uitoolbar = new toolbar_1.Toolbar($("#toolbar")[0], null);
+    uitoolbar.grp.prop('id', 'run_bar');
+    uitoolbar.add('mod+shift+r', 'Reset', 'glyphicon-refresh', resetAndRun).prop('id', 'dbg_reset');
+    uitoolbar.add('mod+shift+h', 'Pause', 'glyphicon-pause', pause).prop('id', 'dbg_pause');
+    // bound before Resume so it takes priority in the debug tool views;
+    // falls through to Resume everywhere else
+    uitoolbar.add('mod+shift+g', 'Go To Address', '', (e) => {
+        if (!promptGoToAddress())
+            resume();
+    });
+    uitoolbar.add('mod+shift+g', 'Resume', 'glyphicon-play', resume).prop('id', 'dbg_go');
+    setupAudioMute();
+    // F8: single-key pause/resume toggle; chip shown via getGlobalShortcuts()
+    uitoolbar.add('F8', 'Pause/Resume', '', togglePauseResume);
+    // F1: context-sensitive help for the active view (editor/tool/platform)
+    uitoolbar.add('F1', 'Help', '', showContextHelp);
+    if (exports.platform.restartAtPC) {
+        uitoolbar.add('mod+shift+a', 'Restart at Cursor', 'glyphicon-play-circle', restartAtCursor).prop('id', 'dbg_restartatline');
+    }
+    uitoolbar.newGroup();
+    uitoolbar.grp.prop('id', 'debug_bar');
+    if (exports.platform.runEval) {
+        uitoolbar.add('mod+shift+d', 'Reset and Debug', 'glyphicon-fast-backward', resetAndDebug).prop('id', 'dbg_restart');
+    }
+    if (exports.platform.stepBack) {
+        uitoolbar.add('mod+shift+j', 'Step Backwards', 'glyphicon-step-backward', runStepBackwards).prop('id', 'dbg_stepback');
+    }
+    if (exports.platform.step) {
+        uitoolbar.add('mod+shift+l', 'Single Step', 'glyphicon-step-forward', singleStep).prop('id', 'dbg_step');
+    }
+    if (exports.platform.stepOver) {
+        uitoolbar.add('mod+shift+k', 'Step Over', 'glyphicon-hand-right', stepOver).prop('id', 'dbg_stepover');
+    }
+    if (exports.platform.runUntilReturn) {
+        uitoolbar.add('mod+shift+i', 'Step Out of Subroutine', 'glyphicon-hand-up', runUntilReturn).prop('id', 'dbg_stepout');
+    }
+    if (exports.platform.runToVsync) {
+        uitoolbar.add('mod+shift+x', 'Next Frame/Interrupt', 'glyphicon-forward', singleFrameStep).prop('id', 'dbg_tovsync');
+    }
+    if ((exports.platform.runEval || exports.platform.runToPC) && !exports.platform_id.startsWith('verilog')) {
+        uitoolbar.add('mod+shift+y', 'Run To Line', 'glyphicon-save', runToCursor).prop('id', 'dbg_toline');
+    }
+    uitoolbar.newGroup();
+    uitoolbar.grp.prop('id', 'xtra_bar');
+    uitoolbar.add('mod+shift+f', 'Search', 'glyphicon-search', searchview_1.openSearchDialog).prop('id', 'dbg_search');
+    // add menu clicks
+    $(".dropdown-menu").collapse({ toggle: false });
+    $("#item_new_file").click(_createNewFile);
+    $("#item_upload_file").click(_uploadNewFile);
+    $("#item_open_directory").click(_openLocalDirectory);
+    $("#item_github_login").click(sync_1._loginToGithub);
+    $("#item_github_logout").click(sync_1._logoutOfGithub);
+    $("#item_github_import").click(sync_1._importProjectFromGithub);
+    $("#item_github_publish").click(sync_1._publishProjectToGithub);
+    $("#item_github_push").click(sync_1._pushProjectToGithub);
+    $("#item_github_pull").click(sync_1._pullProjectFromGithub);
+    $("#item_repo_delete").click(sync_1._removeRepository);
+    $("#item_share_file").click(shareexport_1._shareEmbedLink);
+    $("#item_reset_file").click(_revertFile);
+    $("#item_rename_file").click(_renameFile);
+    $("#item_delete_file").click(_deleteFile);
+    $("#item_download_rom").click(shareexport_1._downloadROMImage);
+    $("#item_download_file").click(shareexport_1._downloadSourceFile);
+    $("#item_download_zip").click(shareexport_1._downloadProjectZipFile);
+    if (exports.platform.getDebugSymbolFile) {
+        $("#item_download_sym").click(shareexport_1._downloadSymFile);
+    }
+    else {
+        $("#item_download_sym").hide();
+    }
+    $("#item_download_allzip").click(shareexport_1._downloadAllFilesZipFile);
+    $("#item_record_video").click(shareexport_1._recordVideo);
+    if ((0, shareexport_1._getCassetteFunction)())
+        $("#item_export_cassette").click(shareexport_1._downloadCassetteFile);
+    else
+        $("#item_export_cassette").hide();
+    if (exports.platform.setFrameRate && exports.platform.getFrameRate) {
+        $("#dbg_slower").click(_slowerFrameRate);
+        $("#dbg_faster").click(_fasterFrameRate);
+        $("#dbg_slowest").click(_slowestFrameRate);
+        $("#dbg_fastest").click(_fastestFrameRate);
+    }
+    $("#item_addfile_include").click(_addIncludeFile);
+    $("#item_addfile_link").click(_addLinkFile);
+    $("#item_request_persist").click(() => requestPersistPermission(true, false));
+    $("#item_settings").click(settings_1.openSettings);
+    updateDebugWindows();
+    // code analyzer?
+    if (exports.platform.newCodeAnalyzer) {
+        uitoolbar.add(null, 'Analyze CPU Timing', 'glyphicon-time', traceTiming);
+    }
+    if (exports.platform.startProbing) {
+        uitoolbar.add(null, 'Highlight Executed Lines', 'glyphicon-fire', _toggleTraceLines).prop('id', 'dbg_tracelines');
+    }
+    // setup replay slider
+    if (exports.platform.setRecorder && exports.platform.advance) {
+        setupReplaySlider();
+    }
+    // help menu items
+    if (exports.platform.showHelp) {
+        let { li, a } = newDropdownListItem('help__' + exports.platform_id, platform_name + ' Info');
+        $("#help_menu").append(li);
+        // opens an external page; don't let the placeholder href change our URL hash
+        $(a).click((e) => { e.preventDefault(); window.open(exports.platform.showHelp(), '_8bws_help'); });
+    }
+    // tool help (one entry per tool this platform can build with)
+    showToolHelp();
+    // internal IDE help (markdown docs shipped with the IDE)
+    {
+        let { li } = newDropdownListItem('#help', 'IDE Help');
+        $("#help_menu").prepend(li);
+    }
+    // all toolchain versions
+    $("#item_tool_versions").click(openToolVersions);
+}
+// F1: open the help topic that matches whatever is focused right now.
+// Going through the hash means Back returns to the previous view.
+function showContextHelp() {
+    if (!exports.projectWindows)
+        return;
+    // widgets embedded outside ProjectWindows (e.g. the Verilog waveform
+    // viewer) register their own topic; prefer that when it has focus
+    var elId = (0, helptopics_1.elementHelpTopicForFocus)();
+    var isEditor = exports.projectWindows.getActive() instanceof editors_1.SourceEditor;
+    var id = elId || (0, helpview_1.helpTopicForView)(exports.projectWindows.getActiveID(), isEditor);
+    var hash = '#help/' + id;
+    if (window.location.hash === hash) {
+        exports.projectWindows.createOrShow(hash);
+    }
+    else {
+        window.location.hash = hash;
+    }
+}
+// Show the IDE's own version (from package.json) in the About menu.
+function showAppVersion() {
+    var label = (0, version_1.getAppVersionLabel)();
+    if (!label)
+        return;
+    $("#item_app_version").text("8bitworkshop " + label).show();
+}
+function openToolVersions() {
+    const esc = (s) => String(s == null ? '' : s)
+        .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    // ---- current platform summary (params + the tools it can reach) ----
+    const params = platforms_1.PLATFORM_PARAMS[exports.platform_id]
+        || platforms_1.PLATFORM_PARAMS[(0, util_1.getBasePlatform)(exports.platform_id)]
+        || platforms_1.PLATFORM_PARAMS[(0, util_1.getRootBasePlatform)(exports.platform_id)];
+    const arch = (params && params.arch) || '—';
+    // extension -> tool, using the platform's own selector. The universe is the
+    // tools' declared extensions (plus dasm's implicit .a), so this matches the
+    // generated docs rather than just the new-file skeletons.
+    const allExts = new Set(['.a']);
+    for (const id in toolmeta_1.TOOL_META)
+        for (const e of toolmeta_1.TOOL_META[id].extensions || [])
+            allExts.add(e);
+    const toolExts = {};
+    const order = [];
+    const add = (tool, ext) => {
+        if (!tool)
+            return;
+        if (!toolExts[tool]) {
+            toolExts[tool] = [];
+            order.push(tool);
+        }
+        if (ext && toolExts[tool].indexOf(ext) < 0)
+            toolExts[tool].push(ext);
+    };
+    if (exports.platform.getDefaultExtensions) {
+        for (const ext of allExts) {
+            let tool = exports.platform.getToolForFilename('test' + ext);
+            let meta = tool && (0, toolmeta_1.getToolMeta)(tool);
+            let claims = !!meta && (meta.extensions || []).indexOf(ext) >= 0;
+            if (claims || (ext === '.a' && tool === 'dasm'))
+                add(tool, ext);
+        }
+    }
+    // always include the tool handling the file that's actually open
+    const mainFile = getCurrentMainFilename();
+    if (mainFile) {
+        let mainTool = exports.platform.getToolForFilename(mainFile);
+        let dot = mainFile.lastIndexOf('.');
+        add(mainTool, dot >= 0 ? mainFile.substring(dot) : '');
+    }
+    order.sort((a, b) => { var _a, _b; return (((_a = (0, toolmeta_1.getToolMeta)(a)) === null || _a === void 0 ? void 0 : _a.name) || a).localeCompare(((_b = (0, toolmeta_1.getToolMeta)(b)) === null || _b === void 0 ? void 0 : _b.name) || b); });
+    const platformTable = `
+    <table class="help">
+      <tr><th>Architecture</th><td>${esc(arch)}</td></tr>
+      ${params && params.cfgfile ? `<tr><th>Default config</th><td>${esc(params.cfgfile)}</td></tr>` : ''}
+      ${params && params.libargs && params.libargs.length ? `<tr><th>Default libraries</th><td>${esc(params.libargs.join(' '))}</td></tr>` : ''}
+      ${params && params.define && params.define.length ? `<tr><th>Defines</th><td>${esc(params.define.join(' '))}</td></tr>` : ''}
+    </table>`;
+    const toolTable = order.map(tool => {
+        let meta = (0, toolmeta_1.getToolMeta)(tool);
+        let version = (0, toolmeta_1.getToolVersionLabel)(meta);
+        let kind = (meta && meta.kind) || '—';
+        let exts = toolExts[tool].length ? toolExts[tool].map(e => `<code>${esc(e)}</code>`).join(' ') : '—';
+        let name = (meta && meta.name) || tool;
+        return `<tr><td>${esc(name)}</td><td>${esc(kind)}</td><td>${esc(version)}</td><td>${exts}</td></tr>`;
+    }).join('\n');
+    bootbox.dialog({
+        title: 'Toolchain Info',
+        onEscape: true,
+        buttons: {
+            docs: {
+                label: 'Full reference',
+                className: 'btn-link',
+                callback: () => { window.location.hash = '#help/toolchains'; },
+            },
+            ok: { label: 'Close', className: 'btn-primary' },
+        },
+        message: `
+    <div class="dialog-scroll">
+      <h5 class="dialog-title">${esc(platform_name)} <small>${esc(exports.platform_id)}</small></h5>
+      ${platformTable}
+      <h5 class="dialog-title">Tools for source files</h5>
+      <table class="help">
+        <tr><th>Tool</th><th>Kind</th><th>Version</th><th>Extensions</th></tr>
+        ${toolTable}
+      </table>
+    </div>`,
+    });
+}
+// Add Help entries for each tool that publishes a page specific to this
+// platform (e.g. cc65's atari.html on atari8): the tool's main docs plus a
+// "<tool> Help for <platform>" entry for the override. Tools with only
+// generic docs are not listed here. Mirrors the extension sweep in
+// openToolVersions().
+function showToolHelp() {
+    let tool = exports.platform.getToolForFilename(getCurrentMainFilename());
+    if (!tool)
+        return;
+    const meta = (0, toolmeta_1.getToolMeta)(tool);
+    if (!meta)
+        return;
+    // include the vendored wasm version when we know it (TOOL_META.version)
+    const version = meta.version ? ' (' + meta.version + ')' : '';
+    const addEntry = (id, label, url) => {
+        let { li, a } = newDropdownListItem(id, label);
+        $("#help_menu").append(li);
+        // opens an external page; don't let the placeholder href change our URL hash
+        $(a).click((e) => { e.preventDefault(); window.open(url, '_8bws_help'); });
+    };
+    // the tool's main documentation page
+    if (meta.helpURL)
+        addEntry('help__' + tool, meta.name + ' Help' + version, meta.helpURL);
+    // ...and the platform-specific page, if it has one
+    const platformUrl = (0, toolmeta_1.getPlatformToolHelpURL)(tool, exports.platform_id);
+    if (platformUrl) {
+        addEntry('help__' + tool + '__' + exports.platform_id, meta.name + ' Help for ' + platform_name, platformUrl);
+    }
+}
+function setupReplaySlider() {
+    var replayslider = $("#replayslider");
+    var clockslider = $("#clockslider");
+    var replayframeno = $("#replay_frame");
+    var clockno = $("#replay_clock");
+    if (!exports.platform.advanceFrameClock)
+        $("#clockdiv").hide(); // TODO: put this test in recorder?
+    var updateFrameNo = () => {
+        replayframeno.text(stateRecorder.lastSeekFrame + "");
+        clockno.text(stateRecorder.lastSeekStep + "");
+    };
+    var sliderChanged = (e) => {
+        _pause();
+        var frame = parseInt(replayslider.val().toString());
+        var step = parseInt(clockslider.val().toString());
+        if (stateRecorder.loadFrame(frame, step) >= 0) {
+            clockslider.attr('min', 0);
+            clockslider.attr('max', stateRecorder.lastStepCount);
+            updateFrameNo();
+            uiDebugCallback(exports.platform.saveState());
+        }
+    };
+    var setFrameTo = (frame) => {
+        _pause();
+        if (stateRecorder.loadFrame(frame) >= 0) {
+            replayslider.val(frame);
+            updateFrameNo();
+            uiDebugCallback(exports.platform.saveState());
+        }
+    };
+    var setClockTo = (clock) => {
+        _pause();
+        var frame = parseInt(replayslider.val().toString());
+        if (stateRecorder.loadFrame(frame, clock) >= 0) {
+            clockslider.val(clock);
+            updateFrameNo();
+            uiDebugCallback(exports.platform.saveState());
+        }
+    };
+    stateRecorder.callbackStateChanged = () => {
+        replayslider.attr('min', 0);
+        replayslider.attr('max', stateRecorder.numFrames());
+        replayslider.val(stateRecorder.currentFrame());
+        clockslider.val(stateRecorder.currentStep());
+        updateFrameNo();
+        showDebugInfo(exports.platform.saveState());
+    };
+    replayslider.on('input', sliderChanged);
+    clockslider.on('input', sliderChanged);
+    //replayslider.on('change', sliderChanged);
+    $("#replay_min").click(() => { setFrameTo(1); });
+    $("#replay_max").click(() => { setFrameTo(stateRecorder.numFrames()); });
+    $("#replay_back").click(() => { setFrameTo(parseInt(replayslider.val().toString()) - 1); });
+    $("#replay_fwd").click(() => { setFrameTo(parseInt(replayslider.val().toString()) + 1); });
+    $("#clock_back").click(() => { setClockTo(parseInt(clockslider.val().toString()) - 1); });
+    $("#clock_fwd").click(() => { setClockTo(parseInt(clockslider.val().toString()) + 1); });
+    $("#replay_bar").show();
+    uitoolbar.add('mod+shift+e', 'Start/Stop Replay Recording', 'glyphicon-record', _toggleRecording).prop('id', 'dbg_record');
+}
+async function showWelcomeMessage() {
+    if (userPrefs.shouldCompleteTour()) {
+        await (0, util_1.loadScript)('lib/bootstrap-tourist.js');
+        var is_vcs = exports.platform_id.startsWith('vcs');
+        var steps = [
+            {
+                element: "#platformsMenuButton",
+                placement: 'right',
+                title: "Platform Selector",
+                content: "You're currently on the \"<b>" + exports.platform_id + "</b>\" platform. You can choose a different one from the menu."
+            },
+            {
+                element: "#preset_select",
+                title: "Project Selector",
+                content: "You can choose different code examples, create your own files, or import projects from GitHub."
+            },
+            {
+                element: "#workspace",
+                title: "Code Editor",
+                content: is_vcs ? "Type your 6502 assembly code into the editor, and it'll be assembled in real-time."
+                    : "Type your source code into the editor, and it'll be compiled in real-time."
+            },
+            {
+                element: "#emulator",
+                placement: 'left',
+                title: "Emulator",
+                content: "We'll load your compiled code into the emulator whenever you make changes."
+            },
+            {
+                element: "#debug_bar",
+                placement: 'bottom',
+                title: "Debug Tools",
+                content: "Use these buttons to set breakpoints, single step through code, pause/resume, and use debugging tools."
+            },
+            {
+                element: "#dropdownMenuButton",
+                title: "Main Menu",
+                content: "Click the menu to create new files, download your code, or share your work with others."
+            },
+            {
+                element: "#sidebar",
+                title: "Sidebar",
+                content: "Pull right to expose the sidebar. It lets you switch between source files, view assembly listings, and use other tools like Disassembler, Memory Browser, and Asset Editor."
+            }
+        ];
+        if ((0, util_1.isProductionHost)()) {
+            steps.unshift({
+                element: "#dropdownMenuButton",
+                placement: 'right',
+                title: "Privacy Notice",
+                content: 'Before we start: we store persistent data in your browser and send performance data to our server. Review our <a href="/privacy.html" target="_new">privacy policy</a>.'
+            });
+            steps.push({
+                element: "#booksMenuButton",
+                placement: 'left',
+                title: "Books",
+                content: "Get some books that explain how to program all of this stuff, and write some games!"
+            });
+        }
+        var tour = new Tour({
+            autoscroll: false,
+            //storage:false,
+            steps: steps,
+            onEnd: () => {
+                userPrefs.completedTour();
+                //requestPersistPermission(false, true);
+            }
+        });
+        setTimeout(() => { tour.start(); }, 2500);
+    }
+}
+///////////////////////////////////////////////////
+function globalErrorHandler(msgevent) {
+    var msg = (msgevent.message || msgevent.error || msgevent) + "";
+    // storage quota full? (Chrome) try to expand it
+    if (msg.indexOf("QuotaExceededError") >= 0) {
+        storageQuotaExceeded();
+    }
+    else {
+        var err = msgevent.error || msgevent.reason;
+        if (err != null && err instanceof emu_1.EmuHalt) {
+            haltEmulation(err);
+        }
+        else if ((0, util_1.isProductionHost)()) {
+            // lightweight self-hosted error reporting
+            (0, errorreport_1.reportErrorToServer)(msg, err, {
+                platform: exports.platform_id,
+                window: exports.projectWindows ? exports.projectWindows.getActiveID() : '',
+                errors: exports.projectWindows.lasterrors || [],
+            });
+        }
+    }
+}
+function haltEmulation(err) {
+    console.log("haltEmulation");
+    _pause();
+    emulationHalted(err);
+    // TODO: reset platform?
+}
+// catch errors
+function installErrorHandler() {
+    window.addEventListener('error', globalErrorHandler);
+    window.addEventListener('unhandledrejection', globalErrorHandler);
+}
+function uninstallErrorHandler() {
+    window.removeEventListener('error', globalErrorHandler);
+    window.removeEventListener('unhandledrejection', globalErrorHandler);
+}
+function gotoNewLocation(replaceHistory, newQueryString) {
+    if (newQueryString) {
+        exports.qs = newQueryString;
+    }
+    uninstallErrorHandler();
+    if (replaceHistory)
+        window.location.replace("?" + $.param(exports.qs));
+    else
+        window.location.href = "?" + $.param(exports.qs);
+}
+function replaceURLState() {
+    if (exports.platform_id)
+        exports.qs.platform = exports.platform_id;
+    delete exports.qs['']; // remove null parameter
+    history.replaceState({}, "", "?" + $.param(exports.qs) + window.location.hash);
+}
+function hashToViewIdResolved(hash) {
+    if (!hash || hash === '#')
+        return null;
+    var id = decodeURIComponent(hash.substring(1));
+    // check for extended asset editor hash (e.g. #asseteditor/filename/startline)
+    if (id.startsWith('asseteditor/'))
+        return '#asseteditor';
+    // check for header viewer window (e.g. #headerview/nes.h); lazily register
+    // so direct-hash navigation works too
+    if (id.startsWith('headerview/')) {
+        openHeaderFile(id.substring('headerview/'.length));
+        return '#' + id;
+    }
+    // check if it's a registered tool window (e.g. #asseteditor)
+    if (exports.projectWindows.isWindow('#' + id))
+        return '#' + id;
+    // otherwise treat as a file path (e.g. hello.asm)
+    if (exports.projectWindows.isWindow(id))
+        return id;
+    return null;
+}
+function installHashChangeHandler() {
+    function onHashChange() {
+        const hash = window.location.hash;
+        const viewId = (hash && hash !== '#') ? hashToViewIdResolved(hash) : null;
+        if (viewId) {
+            if (viewId !== exports.projectWindows.getActiveID()) {
+                exports.projectWindows.createOrShow(viewId);
+            }
+        }
+        else {
+            // empty/unrecognized hash -- e.g. Back button from an extended hash like
+            // #headerview/foo.h, since the main file's URL has no hash. Show main file.
+            const mainFile = exports.current_project.mainPath;
+            if (mainFile && exports.projectWindows.getActiveID() != mainFile) {
+                exports.projectWindows.createOrShow(mainFile);
+            }
+        }
+    }
+    window.addEventListener('popstate', onHashChange);
+    window.addEventListener('hashchange', onHashChange);
+}
+function navigateToInitialHash(initialHash) {
+    if (initialHash && initialHash !== '#') {
+        const viewId = hashToViewIdResolved(initialHash) || exports.current_project.mainPath;
+        history.replaceState(null, '', initialHash);
+        exports.projectWindows.createOrShow(viewId);
+    }
+}
+function addPageFocusHandlers() {
+    var hidden = false;
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState == 'hidden' && exports.platform && exports.platform.isRunning()) {
+            _pause();
+            hidden = true;
+        }
+        else if (document.visibilityState == 'visible' && hidden) {
+            _resume();
+            hidden = false;
+        }
+    });
+    $(window).on("focus", () => {
+        if (hidden) {
+            _resume();
+            hidden = false;
+        }
+    });
+    $(window).on("blur", () => {
+        if (exports.platform && exports.platform.isRunning()) {
+            _pause();
+            hidden = true;
+        }
+    });
+    $(window).on("orientationchange", () => {
+        if (exports.platform && exports.platform.resize)
+            setTimeout(exports.platform.resize.bind(exports.platform), 200);
+    });
+    if (!isEmbed) {
+        // hide/show the filter with its breakpoint, and drop the narrowing while it
+        // is hidden so the picker never shows an invisible filter
+        var filterAvailable = isPresetFilterAvailable();
+        $(window).on("resize", () => {
+            var available = isPresetFilterAvailable();
+            if (available != filterAvailable) {
+                filterAvailable = available;
+                updateSelector();
+            }
+        });
+    }
+}
+// TODO: merge w/ player.html somehow?
+function renderControls(div) {
+    div.empty();
+    for (var hint of controls_1.PLATFORM_CONTROLS[(0, util_1.getRootBasePlatform)(exports.platform_id)] || []) {
+        var def = $('<span class="control-def"/>').appendTo(div);
+        for (var key of hint.keys) {
+            // words get the small key cap, arrows the full-size one
+            var cap = $('<span class="control-key"/>').toggleClass('small', /[a-z]/i.test(key)).appendTo(def);
+            if (key.indexOf('\n') >= 0) {
+                cap.css({ display: 'inline-block', 'font-family': 'monospace' });
+                key.split('\n').forEach((line, i) => { if (i)
+                    cap.append('<br>'); cap.append(document.createTextNode(line)); });
+            }
+            else {
+                cap.text(key);
+            }
+        }
+        def.append(document.createTextNode(' ' + hint.action));
+        div.append(' ');
+    }
+    return div.children().length > 0;
+}
+const AUDIO_MUTED_KEY = '8bitworkshop.muted';
+let audioMuteButton = null;
+function loadAudioMutePref() {
+    if (hasLocalStorage && !isEmbed && localStorage.getItem(AUDIO_MUTED_KEY) === 'true') {
+        (0, audio_1.setAudioMuted)(true);
+    }
+}
+function saveAudioMutePref() {
+    if (hasLocalStorage && !isEmbed) {
+        localStorage.setItem(AUDIO_MUTED_KEY, (0, audio_1.isAudioMuted)() ? 'true' : 'false');
+    }
+}
+function updateAudioMuteButton() {
+    if (!audioMuteButton)
+        return;
+    const muted = (0, audio_1.isAudioMuted)();
+    audioMuteButton.attr('aria-pressed', muted ? 'true' : 'false')
+        .prop('title', muted ? 'Unmute' : 'Mute')
+        .toggleClass('active', muted)
+        .find('.glyphicon')
+        .toggleClass('glyphicon-volume-up', !muted)
+        .toggleClass('glyphicon-volume-off', muted);
+}
+function toggleAudioMute() {
+    const muted = !(0, audio_1.isAudioMuted)();
+    (0, audio_1.setAudioMuted)(muted);
+    saveAudioMutePref();
+    // hosts that own their audio (Javatari) need to hear about it too
+    if (exports.platform.setMuted)
+        exports.platform.setMuted(muted);
+    // Unmuting is itself the user gesture browsers require. Only resume a
+    // running emulator: unmuting while paused should not start it.
+    if (!muted && exports.platform && exports.platform.isRunning())
+        exports.platform.resume();
+}
+function setupAudioMute() {
+    // platforms either use the shared SampleAudio graph or implement setMuted
+    // for their own audio (Javatari); VCS/jt4 and MAME may have neither
+    const canMute = exports.platform && (exports.platform.audio || exports.platform.setMuted);
+    if (!canMute)
+        return;
+    audioMuteButton = uitoolbar.add('', 'Mute', 'glyphicon-volume-up', toggleAudioMute);
+    (0, audio_1.onAudioMuteChange)(updateAudioMuteButton);
+    if (exports.platform.setMuted)
+        exports.platform.setMuted((0, audio_1.isAudioMuted)());
+    updateAudioMuteButton();
+}
+function showAudioHint() {
+    const hint = $("#emuaudiohint");
+    if (!hint.length)
+        return;
+    let wasBlocked = false;
+    let unsubscribeState = null;
+    let unsubscribeMute = null;
+    const update = () => {
+        if ((0, audio_1.isAudioBlocked)()) {
+            wasBlocked = true;
+            // an explicit mute is not the autoplay block, so don't promise to unmute
+            hint.text((0, audio_1.isAudioMuted)() ? 'Click screen to use controls' : 'Click screen to use controls and unmute audio');
+            hint.show();
+        }
+        else {
+            hint.hide();
+            if (wasBlocked) {
+                unsubscribeState && unsubscribeState();
+                unsubscribeMute && unsubscribeMute();
+            }
+        }
+    };
+    // AudioContext.resume() is async, so wait for the context to actually start
+    // instead of hiding on the click that asked it to.
+    unsubscribeState = (0, audio_1.onAudioStateChange)(update);
+    unsubscribeMute = (0, audio_1.onAudioMuteChange)(update);
+    update();
+}
+function showInstructions() {
+    showAudioHint();
+    var div = $("#emucontrols");
+    var hasControls = renderControls(div);
+    if (hasControls && exports.platform_id.endsWith(".mame"))
+        div.show(); // TODO: MAME seems to eat the focus() event
+    var vcanvas = $("#emulator").find("canvas");
+    if (vcanvas) {
+        const focusHandler = () => {
+            if (exports.platform.isRunning()) {
+                if (hasControls)
+                    div.fadeIn(200);
+                // unlock audio for the browser's autoplay policy (resume() no-ops if
+                // already running; don't pair with pause() first -- suspend()/resume()
+                // are async and racing them here left the AudioContext stuck suspended).
+                // Do not change an explicit mute: only the mute button does that.
+                exports.platform.resume();
+            }
+        };
+        vcanvas.on('focus', focusHandler);
+        // clicking an already-focused canvas doesn't fire focus, but it is still
+        // a user gesture that can unlock a suspended AudioContext
+        vcanvas.on('click', focusHandler);
+        vcanvas.on('blur', () => {
+            if (hasControls)
+                div.fadeOut(200);
+        });
+    }
+}
+async function startPlatform() {
+    if (!emu_1.PLATFORMS[exports.platform_id])
+        throw Error("Invalid platform '" + exports.platform_id + "'.");
+    let emudiv = $("#emuscreen")[0];
+    let options = (0, util_1.decodeQueryString)(exports.qs.options || '');
+    exports.platform = new emu_1.PLATFORMS[exports.platform_id](emudiv, options);
+    setPlatformUI();
+    stateRecorder = new recorder_1.StateRecorderImpl(exports.platform);
+    const PRESETS = exports.platform.getPresets ? exports.platform.getPresets() : [];
+    if (!exports.qs.file) {
+        // try to load last file (redirect)
+        var lastid = userPrefs.getLastPreset();
+        // load first preset file, unless we're in a repo
+        var defaultfile = lastid || (exports.repo_id ? null : (PRESETS[0] && PRESETS[0].id));
+        exports.qs.file = defaultfile || 'DEFAULT';
+        if (!defaultfile) {
+            (0, dialogs_1.alertError)("There is no default main file for this project. Try selecting one from the pulldown.");
+        }
+    }
+    // legacy vcs stuff
+    if (exports.platform_id == 'vcs' && exports.qs.file.startsWith('examples/') && !exports.qs.file.endsWith('.a')) {
+        exports.qs.file += '.a';
+    }
+    // start platform and load file
+    var initialHash = window.location.hash;
+    replaceURLState();
+    installErrorHandler();
+    (0, emu_1.setHaltHandler)(haltEmulation);
+    (0, hdlhost_1.installHDLHost)();
+    await exports.platform.start();
+    await loadBIOSFromProject();
+    await initProject();
+    await loadProject(exports.qs.file);
+    navigateToInitialHash(initialHash);
+    installHashChangeHandler();
+    exports.platform.sourceFileFetch = (path) => exports.current_project.filedata[path];
+    setupDebugControls();
+    // context-sensitive shortcuts/status bar (hidden by CSS on small windows)
+    if (!baseviews_1.isMobileDevice && $("#shortcuts_bar").length) {
+        (0, shortcutbar_1.initShortcutBar)($("#shortcuts_bar")[0]);
+        (0, shortcutbar_1.setGlobalShortcutsFn)(getGlobalShortcuts);
+        (0, shortcutbar_1.setViewShortcutsFn)(() => {
+            // view-specific keys (CodeMirror bindings) only apply while that view has
+            // focus; e.g. clicking the verilog waveform keeps the editor active but blurs it
+            var div = exports.projectWindows.id2div[exports.projectWindows.activeid];
+            var viewHasFocus = div && document.activeElement && div.contains(document.activeElement);
+            var wnd = exports.projectWindows.getActive();
+            var shortcuts = viewHasFocus && wnd && wnd.getShortcuts ? wnd.getShortcuts() : [];
+            // debug chips ride along with the view zone (they're gated on debugSessionActive)
+            return [...getDebugShortcuts(), ...shortcuts];
+        });
+        // focus changes can invalidate view-specific shortcuts
+        $(document).on('focusin focusout', () => (0, shortcutbar_1.refreshShortcutBar)());
+        (0, shortcutbar_1.refreshShortcutBar)();
+        (0, shortcutbar_1.setBarVisible)((0, settings_1.loadSettings)().showStatusBar);
+    }
+    addPageFocusHandlers();
+    showInstructions();
+    if (isEmbed) {
+        hideControlsForEmbed();
+    }
+    else {
+        updateSelector();
+        updateBooksMenu();
+        showWelcomeMessage();
+    }
+    revealTopBar();
+}
+function hideControlsForEmbed() {
+    $('#dropdownMenuButton').hide();
+    $('#platformsMenuButton').hide();
+    $('#preset_filter_menu').hide();
+    $('#booksMenuButton').hide();
+}
+function updateBooksMenu() {
+    var active = (0, books_1.bookFor)(exports.platform_id);
+    for (var book of books_1.BOOKS) {
+        var link = $('<a class="dropdown-item dropdown-link">')
+            .attr({ href: book.url, target: '_book_' + book.id })
+            .toggleClass('book-active', book === active)
+            .append($('<img>').attr('src', 'images/' + book.image))
+            .append('&nbsp;&nbsp;', $('<span class="book-title">').text(book.title));
+        $('#booksMenuList').append($('<li>').append(link));
+    }
+}
+function revealTopBar() {
+    setTimeout(() => { $("#controls_dynamic").css('visibility', 'inherit'); }, 250);
+}
+function loadImportedURL(url) {
+    // TODO: zip file?
+    const ignore = (0, util_1.parseBool)(exports.qs.ignore) || isEmbed;
+    (0, dialogs_1.setWaitDialog)(true);
+    (0, util_1.getWithBinary)(url, async (data) => {
+        if (data) {
+            var path = (0, util_1.getFilenameForPath)(url);
+            console.log("Importing " + data.length + " bytes as " + path);
+            try {
+                var olddata = await store.getItem(path);
+                (0, dialogs_1.setWaitDialog)(false);
+                if (olddata != null && ignore) {
+                    // ignore=1, do nothing
+                }
+                else if (olddata == null || confirm("Replace existing file '" + path + "'?")) {
+                    await store.setItem(path, data);
+                }
+                delete exports.qs.importURL;
+                exports.qs.file = path;
+                replaceURLState();
+                loadAndStartPlatform();
+            }
+            finally {
+                (0, dialogs_1.setWaitDialog)(false);
+            }
+        }
+        else {
+            (0, dialogs_1.alertError)("Could not load source code from URL: " + url);
+            (0, dialogs_1.setWaitDialog)(false);
+        }
+    }, 'text');
+}
+async function loadFormDataUpload() {
+    var ignore = (0, util_1.parseBool)(exports.qs.ignore);
+    var force = (0, util_1.parseBool)(exports.qs.force);
+    if (isEmbed) {
+        ignore = !force; // ignore is default when embed=1 unless force=1
+    }
+    else {
+        force = false; // can't use force w/o embed=1
+    }
+    for (var i = 0; i < 20; i++) {
+        let path = exports.qs['file' + i + '_name'];
+        let dataenc = exports.qs['file' + i + '_data'];
+        if (path == null || dataenc == null)
+            break;
+        var olddata = await store.getItem(path);
+        if (!(ignore && olddata)) {
+            let value = dataenc;
+            if (exports.qs['file' + i + '_type'] == 'binary') {
+                value = (0, util_1.stringToByteArray)(atob(value));
+            }
+            if (!olddata || force || confirm("Replace existing file '" + path + "'?")) {
+                await store.setItem(path, value);
+            }
+        }
+        if (i == 0) {
+            exports.qs.file = path;
+        } // set main filename
+        delete exports.qs['file' + i + '_name'];
+        delete exports.qs['file' + i + '_data'];
+        delete exports.qs['file' + i + '_type'];
+    }
+    delete exports.qs.ignore;
+    delete exports.qs.force;
+    replaceURLState();
+}
+function setPlatformUI() {
+    var name = exports.platform.getPlatformName && exports.platform.getPlatformName();
+    var menuitem = $('a[href="?platform=' + exports.platform_id + '"]');
+    if (menuitem.length) {
+        menuitem.addClass("dropdown-item-checked");
+        name = name || menuitem.text() || name;
+    }
+    platform_name = name || exports.platform_id;
+    $(".platform_name").text(platform_name);
+}
+function getPlatformAndRepo() {
+    // lookup repository for this platform (TODO: enable cross-platform repos)
+    exports.platform_id = exports.qs.platform || userPrefs.getLastPlatformID();
+    exports.repo_id = exports.qs.repo;
+    // only look at cached repo_id if file= is not present, so back button works
+    if (!exports.qs.repo && !exports.qs.file)
+        exports.repo_id = userPrefs.getLastRepoID(exports.platform_id);
+    // are we in a repo?
+    if (hasLocalStorage && exports.repo_id && exports.repo_id !== '/') {
+        var repo = (0, services_1.getRepos)()[exports.repo_id];
+        // override query string params w/ repo settings
+        if (repo) {
+            console.log(exports.platform_id, exports.qs, repo);
+            exports.qs.repo = exports.repo_id;
+            if (repo.platform_id && !exports.qs.platform)
+                exports.qs.platform = exports.platform_id = repo.platform_id;
+            if (repo.mainPath && !exports.qs.file)
+                exports.qs.file = repo.mainPath;
+            // TODO: update repo definition if new main file compiles successfully
+            //requestPersistPermission(true, true);
+        }
+    }
+    else {
+        exports.repo_id = '';
+        delete exports.qs.repo;
+    }
+    // add default platform
+    if (!exports.platform_id) {
+        if (isEmbed)
+            (0, dialogs_1.fatalError)(`The 'platform' must be specified when embed=1`);
+        // first launch: open a random demo from the books instead of Hello World
+        const demo = (0, books_1.firstVisitDemo)(exports.qs, userPrefs.isFirstVisit());
+        if (demo) {
+            console.log(`first launch: opening book demo ${demo.platform}/${demo.file}`);
+            exports.platform_id = exports.qs.platform = demo.platform;
+            exports.qs.file = demo.file;
+        }
+        else {
+            exports.platform_id = exports.qs.platform = "vcs";
+        }
+    }
+}
+// start
+async function startUI() {
+    showAppVersion();
+    // import from github?
+    if (exports.qs.githubURL) {
+        (0, sync_1.importProjectFromGithub)(exports.qs.githubURL, true);
+        return;
+    }
+    // repo= given, but not imported yet? offer to import it from github
+    // (repo can be "user/repo" or "user/repo/tree/branch/...")
+    if (hasLocalStorage && exports.qs.repo && !(0, services_1.getRepos)()[exports.qs.repo] && exports.qs.repo !== '/') {
+        if (confirm(`Repository '${exports.qs.repo}' was not found locally. Import it from GitHub?`)) {
+            (0, sync_1.importProjectFromGithub)('https://github.com/' + exports.qs.repo, true);
+            return;
+        }
+        delete exports.qs.repo; // continue without repo
+    }
+    getPlatformAndRepo();
+    loadAudioMutePref();
+    (0, layout_1.setupSplits)({
+        getPlatformId: () => exports.platform_id,
+        isEmbed: isEmbed,
+        hasLocalStorage: hasLocalStorage,
+        resizePlatform: () => { if (exports.platform && exports.platform.resize)
+            exports.platform.resize(); },
+        resizeWindows: () => { if (exports.projectWindows)
+            exports.projectWindows.resize(); },
+        // in tab mode only one pane is visible; pause the emulator when the
+        // emulator tab isn't on screen, and resume it when it comes back
+        onTabChanged: (tab) => {
+            if (!isPlatformReady())
+                return;
+            if (tab !== 'emulator') {
+                if (exports.platform.isRunning()) {
+                    _pause();
+                    tabPausedEmulator = true; // remember it was us, not the user
+                }
+            }
+            else if (tabPausedEmulator) {
+                tabPausedEmulator = false;
+                if (!exports.platform.isRunning())
+                    _resume();
+            }
+        },
+    });
+    // get store ID, repo id or platform id
+    exports.store_id = exports.repo_id || (0, util_1.getBasePlatform)(exports.platform_id);
+    // are we embedded?
+    if (isEmbed) {
+        exports.store_id = (document.referrer || document.location.href) + exports.store_id;
+    }
+    // create store
+    store = (0, project_1.createNewPersistentStore)(exports.store_id);
+    // is this an importURL?
+    if (exports.qs.importURL) {
+        loadImportedURL(exports.qs.importURL);
+        return; // TODO: make async
+    }
+    // is this a file POST?
+    if (exports.qs.file0_name) {
+        await loadFormDataUpload();
+    }
+    // load and start platform object
+    loadAndStartPlatform();
+}
+async function loadAndStartPlatform() {
+    try {
+        var module = await (0, _index_1.importPlatform)((0, util_1.getRootBasePlatform)(exports.platform_id));
+        console.log("starting platform", exports.platform_id); // loaded required <platform_id>.js file
+        await startPlatform();
+        exports.projectWindows.titlePrefix = document.title + " [" + exports.platform_id + "] - " + (exports.repo_id ? ('[' + exports.repo_id + '] - ') : '');
+        exports.projectWindows.updateTitle(exports.projectWindows.getActiveID() || exports.current_project.mainPath);
+    }
+    catch (e) {
+        console.log(e);
+        (0, dialogs_1.alertError)('Platform "' + exports.platform_id + '" failed to load.');
+    }
+    finally {
+        revealTopBar();
+    }
+}
+//// ELECTRON (and other external) STUFF
+function setTestInput(path, data) {
+    exports.platform.writeFile(path, data);
+}
+function getTestOutput(path) {
+    return exports.platform.readFile(path);
+}
+function getSaveState() {
+    return exports.platform.saveState();
+}
+function emulationHalted(err) {
+    var msg = (err && err.message) || msg;
+    showExceptionAsError(err, msg);
+    const state = exports.platform.saveState ? exports.platform.saveState() : null;
+    // A trap halts with the PC on the compiler's spin stub; the address that
+    // faulted is on the stack. Show the arrow there, and keep it there: the
+    // final debug tick refreshes the editor from lastDebugState after we return.
+    if (state && state.c && err && err.pc != null) {
+        exports.lastDebugState = Object.assign(Object.assign({}, state), { c: Object.assign(Object.assign({}, state.c), { PC: err.pc }) });
+    }
+    else {
+        exports.lastDebugState = state;
+    }
+    // passive refresh: show the PC gutter arrow but don't move the cursor or
+    // repaint the current line, since the user may be typing
+    exports.projectWindows.refresh(false);
+    if (state) {
+        showDebugInfo(state);
+        // don't do this because it'll mess with user selected window!
+        //openRelevantListing(state);
+    }
+}
+async function reloadWorkspaceFile(path) {
+    var oldval = exports.current_project.filedata[path];
+    if (oldval != null) {
+        exports.projectWindows.updateFile(path, await alternateLocalFilesystem.getFileData(path));
+        console.log('updating file', path);
+    }
+}
+function writeOutputROMFile() {
+    if (isElectron && current_output instanceof Uint8Array) {
+        var prefix = (0, util_1.getFilenamePrefix)(getCurrentMainFilename());
+        var suffix = (exports.platform.getROMExtension && exports.platform.getROMExtension(current_output))
+            || "-" + (0, util_1.getBasePlatform)(exports.platform_id) + ".bin";
+        alternateLocalFilesystem.setFileData(`bin/${prefix}${suffix}`, current_output);
+    }
+}
+// Start UI
+function startUIWhenVisible() {
+    let started = false;
+    let observer = new IntersectionObserver((entries, observer) => {
+        for (var entry of entries) {
+            if (entry.isIntersecting && !started) {
+                startUI();
+                started = true;
+            }
+            if (entry.intersectionRatio == 0 && isPlatformReady() && exports.platform.isRunning()) {
+                _pause();
+            }
+            if (entry.intersectionRatio > 0 && isPlatformReady() && !exports.platform.isRunning()) {
+                _resume();
+            }
+        }
+    }, {});
+    observer.observe($("#emulator")[0]); //window.document.body);
+}
+/// start UI if in browser (not node)
+if (typeof process === 'undefined') {
+    // if embedded, do not start UI until we scroll past it
+    if (isEmbed && typeof IntersectionObserver === 'function') {
+        startUIWhenVisible();
+    }
+    else {
+        startUI();
+    }
+}
+//# sourceMappingURL=ui.js.map

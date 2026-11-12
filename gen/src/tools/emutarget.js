@@ -1,0 +1,94 @@
+"use strict";
+// The Node side of headless emulation: browser mocks and platform loading.
+// The emulator driver itself is EmuCore (src/common/emucore.ts); EmuTarget is
+// the name the CLI and the extension know it by.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DEFAULT_MAX_FRAMES = exports.EmuTarget = void 0;
+exports.loadPlatform = loadPlatform;
+exports.captureRejectionListeners = captureRejectionListeners;
+exports.dropAbortHandlers = dropAbortHandlers;
+exports.installNodeMocks = installNodeMocks;
+const emucore_1 = require("../common/emucore");
+const emu_1 = require("../common/emu");
+const util_1 = require("../common/util");
+const _index_1 = require("../platform/_index");
+const toolroot_1 = require("./toolroot");
+const nodemock_1 = require("./nodemock");
+var emucore_2 = require("../common/emucore");
+Object.defineProperty(exports, "EmuTarget", { enumerable: true, get: function () { return emucore_2.EmuCore; } });
+Object.defineProperty(exports, "DEFAULT_MAX_FRAMES", { enumerable: true, get: function () { return emucore_2.DEFAULT_MAX_FRAMES; } });
+/** Load a platform module by ID (e.g. "nes", "c64.wasm", "atari8-5200"). */
+async function loadPlatform(platformId, options) {
+    await (0, toolroot_1.ensureToolchains)(platformId);
+    installNodeMocks((0, toolroot_1.toolRoot)());
+    // a headless host may load more than one platform (or the same one twice)
+    // in a process; scripts kept global state, so evaluate them fresh each time
+    (0, nodemock_1.resetScripts)();
+    const baseId = (0, util_1.getRootBasePlatform)(platformId);
+    // a platform module (verilog) may pull in an Emscripten runtime whose
+    // rejection handler aborts the host; disarm it around the import
+    const keep = captureRejectionListeners();
+    // the explicit import switch, so bundlers can find every platform module
+    await (0, _index_1.importPlatform)(baseId);
+    dropAbortHandlers(keep);
+    const PlatformClass = emu_1.PLATFORMS[platformId] || emu_1.PLATFORMS[baseId];
+    if (!PlatformClass) {
+        throw new Error(`Platform '${platformId}' not found. Available: ${Object.keys(emu_1.PLATFORMS).sort().join(', ')}`);
+    }
+    return new emucore_1.EmuCore(platformId, new PlatformClass(null, options));
+}
+let mocksInstalled = false;
+/**
+ * The process-level events an Emscripten runtime hooks to abort the host: an
+ * unhandled rejection makes it abort, and its uncaughtException handler
+ * rethrows anything that is not one of its own runtime errors, which node
+ * turns into exit code 7. Both take the host down with them, so they are
+ * dropped when a platform module is loaded.
+ */
+const RUNTIME_EVENTS = ['unhandledRejection', 'uncaughtException'];
+/** The process-level listeners currently installed, for the events above. */
+function captureRejectionListeners() {
+    const snapshot = new Map();
+    for (const event of RUNTIME_EVENTS)
+        snapshot.set(event, new Set(process.listeners(event)));
+    return snapshot;
+}
+/**
+ * Drop process-level handlers added since `keep` was captured. Emscripten
+ * runtimes (binaryen, imported by the verilog platform) register one that
+ * aborts the host, so a stray async rejection from an emulator would
+ * otherwise kill the process or worker thread. A host that wants to collect
+ * the rejections installs its own listener before capturing; otherwise a
+ * logging one is left so Node doesn't fall back to its default throw.
+ */
+function dropAbortHandlers(keep) {
+    for (const event of RUNTIME_EVENTS) {
+        const before = keep.get(event);
+        for (const listener of process.listeners(event)) {
+            if (!before || !before.has(listener))
+                process.removeListener(event, listener);
+        }
+    }
+    if (process.listenerCount('unhandledRejection') === 0) {
+        process.on('unhandledRejection', (reason) => console.error('unhandled rejection:', reason));
+    }
+}
+/**
+ * Stub out the browser APIs that the platform modules expect. fetch() reads
+ * files (BIOS images, wasm cores) and loadScript() evaluates scripts relative
+ * to `rootDir`. Only the first call takes effect.
+ */
+function installNodeMocks(rootDir = process.cwd()) {
+    // the binaryen shim (extension build) reads this when it is imported on the
+    // main thread, where workerData is unavailable (presetindex)
+    globalThis.__8bitworkshopAssetRoot = rootDir;
+    if (mocksInstalled)
+        return;
+    mocksInstalled = true;
+    (0, nodemock_1.mockGlobals)();
+    (0, nodemock_1.mockAudio)();
+    (0, nodemock_1.mockFetch)(rootDir);
+    (0, nodemock_1.mockScripts)(rootDir);
+    (0, nodemock_1.mockDOM)();
+}
+//# sourceMappingURL=emutarget.js.map

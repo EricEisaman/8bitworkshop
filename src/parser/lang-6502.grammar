@@ -1,0 +1,150 @@
+@top Program { Line* }
+
+@skip { space | Comment }
+
+Line {
+  MacroDef |
+  RepeatBlock |
+  Label? Statement? eol
+}
+
+Statement {
+  Instruction |
+  Directive |
+  HexDirective |
+  ControlOp
+}
+
+Label { (Identifier | LocalIdentifier) Colon | Identifier | LocalIdentifier }
+
+Instruction {
+  (Opcode | IllegalOpcode) Operand?
+}
+
+@external specialize {Identifier} registerSpecializer from "../../src/parser/tokens-6502" { Register }
+@external specialize {Identifier} onOffSpecializer from "../../src/parser/tokens-6502" { OnOff }
+@external specialize {Identifier} hexOpSpecializer from "../../src/parser/tokens-6502" { HexOp }
+@external specialize {Identifier} opcodeSpecializer from "../../src/parser/tokens-6502" { Opcode, IllegalOpcode }
+
+Directive {
+  PseudoOp (Expression)* |
+  Equals (Expression)*
+}
+
+@external specialize {Identifier} pseudoOpSpecializer from "../../src/parser/tokens-6502" { PseudoOp }
+@external specialize {Identifier} localIdentifierSpecializer from "../../src/parser/tokens-6502" { LocalIdentifier }
+
+HexDirective {
+  HexOp HexByte*
+}
+
+@external tokens hexTokenizer from "../../src/parser/tokens-6502" { HexByte }
+
+@external specialize {Identifier} macSpecializer from "../../src/parser/tokens-6502" { Mac, MacEnd, Repeat, RepEnd }
+
+@external specialize {Identifier} controlOpSpecializer from "../../src/parser/tokens-6502" { ControlOp }
+
+MacroDef {
+  Mac Identifier eol Line* MacEnd eol
+}
+
+RepeatBlock {
+  Repeat Expression? eol Line* RepEnd eol
+}
+
+CurrentAddress {
+  @specialize<Identifier, ".">
+}
+
+Expression {
+  Expression !logic LogicOp Expression |
+  Expression !bit BitOp Expression |
+  Expression !compare (CompareOp | BinaryLt | BinaryGt) Expression |
+  Expression !term (ArithOp | Plus | Minus | Percent) Expression |
+  UnaryExpression |
+  Value |
+  "(" Expression ")"
+}
+
+UnaryExpression {
+  (Plus | Minus | Not | Tilde | UnaryLt | UnaryGt) Expression
+}
+
+BinaryLt { lt !bin }
+BinaryGt { gt !bin }
+UnaryLt { lt !un }
+UnaryGt { gt !un }
+
+Value {
+  Number |
+  Identifier |
+  LocalIdentifier |
+  OnOff |
+  CurrentAddress |
+  String |
+  Char
+}
+
+Operand {
+  ImmediatePrefix Expression |
+  "(" Expression Comma Register ")" |
+  Expression (Comma Register)? |
+  Register
+}
+
+@tokens {
+  Identifier { $[a-zA-Z_.] $[a-zA-Z0-9_.]* }
+
+  Number {
+    "$" $[0-9a-fA-F]+ |
+    "%" $[01]+ |
+    $[0-9]+
+  }
+
+  String { '"' !["\n]* '"' }
+
+  Char { "'" ![\n] "'"? }
+
+  Comment { ";" ![\n]* }
+
+  space { $[ \t]+ }
+  eol { $[\n\r]+ }
+
+  Comma { "," }
+  Colon { ":" }
+  ImmediatePrefix { "#" }
+  "(" ")"
+
+  ArithOp { "*" | "/" }
+  Percent { "%" }
+  Plus { "+" }
+  Minus { "-" }
+
+  BitOp { "&" | "|" | "^" | "<<" | ">>" }
+  Tilde { "~" }
+
+  LogicOp { "&&" | "||" }
+  Not { "!" }
+
+  Equals { "=" }
+  CompareOp { "==" | "!=" | "<=" | ">=" }
+  lt { "<" }
+  gt { ">" }
+
+  @precedence { String, Char, Number, Percent, Identifier }
+}
+
+@precedence {
+  un,
+  term @left,
+  compare @left,
+  bit @left,
+  logic @left,
+  bin @left,
+  PseudoOp,
+  Opcode,
+  IllegalOpcode,
+  Label
+}
+
+@detectDelim

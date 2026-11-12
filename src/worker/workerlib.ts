@@ -1,0 +1,160 @@
+
+// workerlib.ts - Node.js-friendly entry point for the worker build system
+// Re-exports core worker functionality without Web Worker onmessage/postMessage wiring
+// FOR TESTING ONLY
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { store, builder } from "./builder";
+import { emglobal } from "./wasmutils";
+import { setupRequireFunction, handleMessage } from "./workermain";
+import { ignoreGlueProcessHandlers, noteGlueScript } from "./gluehandlers";
+
+export { handleMessage };
+
+export { store, builder };
+export { PLATFORM_PARAMS } from "./platforms";
+export { TOOLS } from "./workertools";
+
+type BlobPart = string | ArrayBuffer | Uint8Array | ArrayBufferView;
+
+class Blob {
+  private bytes: Uint8Array;
+  size: number;
+  length: number;
+  constructor(parts: BlobPart | BlobPart[]) {
+    var list = Array.isArray(parts) ? parts : [parts];
+    var chunks: Uint8Array[] = [];
+    var total = 0;
+    for (var p of list) {
+      var b: Uint8Array;
+      if (typeof p == 'string') {
+        // a binary string: one byte per character
+        b = new Uint8Array(p.length);
+        for (var i = 0; i < p.length; i++) b[i] = p.charCodeAt(i) & 0xff;
+      } else if (ArrayBuffer.isView(p)) {
+        b = new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+      } else {
+        b = new Uint8Array(p);
+      }
+      chunks.push(b);
+      total += b.length;
+    }
+    this.bytes = new Uint8Array(total);
+    var off = 0;
+    for (var c of chunks) {
+      this.bytes.set(c, off);
+      off += c.length;
+    }
+    this.size = total;
+    this.length = total;
+  }
+  slice(a?: number, b?: number): Blob {
+    return new Blob(this.bytes.slice(a, b));
+  }
+  arrayBuffer(): Uint8Array {
+    return this.asArrayBuffer();
+  }
+  asArrayBuffer(): Uint8Array {
+    return this.bytes.slice();
+  }
+}
+
+// The Emscripten glue running under Node adds uncaughtException and
+// unhandledRejection handlers every time a tool module is instantiated. They
+// rethrow or abort, which kills a long-lived host (the VS Code extension, the
+// CLI, a mocha worker), and they pile up, one pair per tool per build.
+// ignoreGlueProcessHandlers() drops the ones the glue adds; the build
+// catches tool errors itself.
+
+/**
+ * Set up the Node.js environment to provide XMLHttpRequest, fetch, and other
+ * browser globals that the worker build system expects.
+ * Call this once before using handleMessage/builder.
+ * `rootDir` is the directory holding src/worker (toolchain assets); it
+ * defaults to the current directory.
+ */
+export function setupNodeEnvironment(rootDir: string = process.cwd()) {
+  var workerDir = path.resolve(rootDir, 'src/worker');
+  // Basic globals expected by various parts of the worker system
+  // Some Emscripten-generated WASM modules check for __filename/__dirname
+  if (typeof globalThis.__filename === 'undefined') {
+    (globalThis as any).__filename = __filename;
+  }
+  if (typeof globalThis.__dirname === 'undefined') {
+    (globalThis as any).__dirname = __dirname;
+    // TODO: support require('path').dirname
+  }
+  emglobal.window = emglobal;
+  emglobal.exports = {};
+  emglobal.self = emglobal;
+  emglobal.location = { href: '.' };
+  emglobal.path = path;
+  emglobal.btoa = require('btoa');
+  emglobal.atob = require('atob');
+  try { emglobal.navigator = emglobal; } catch (e) { /* read-only in newer Node */ }
+  emglobal.ResizeObserver = class { observe() { } };
+
+  // XMLHttpRequest shim that reads from the local filesystem
+  emglobal.XMLHttpRequest = function () {
+    this.open = function (method: string, url: string, async?: boolean) {
+      if (this.responseType == 'json') {
+        var txt = fs.readFileSync(path.resolve(workerDir, url), 'utf-8');
+        this.response = JSON.parse(txt);
+      } else if (this.responseType == 'blob') {
+        var data = fs.readFileSync(path.resolve(workerDir, url), { encoding: 'binary' });
+        this.response = new Blob(data);
+      } else if (this.responseType == 'arraybuffer') {
+        var data = fs.readFileSync(path.resolve(workerDir, url), { encoding: 'binary' });
+        this.response = new Blob(data).asArrayBuffer();
+      }
+      this.status = this.response ? 200 : 404;
+    };
+    this.send = function () { };
+  };
+
+  // Blob factory for the worker code (see wasmutils.makeBlob)
+  emglobal.makeBlob = (bytes: Uint8Array) => new Blob(bytes);
+
+  // FileReaderSync shim
+  emglobal.FileReaderSync = function () {
+    this.readAsArrayBuffer = function (blob: any) {
+      return blob.asArrayBuffer();
+    };
+  };
+
+  // fetch shim that reads from the local filesystem
+  emglobal.fetch = function (filepath: string) {
+    return new Promise((resolve, reject) => {
+      try {
+        var bin = fs.readFileSync(path.resolve(rootDir, filepath), { encoding: 'binary' });
+        var response = new Blob(bin);
+        resolve(response);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  };
+
+  // importScripts shim - runs scripts in the global context like a web worker would.
+  // In the web worker, importScripts loads relative to the worker bundle.
+  // PWORKER is "../../src/worker/", so paths like "../../src/worker/asmjs/dasm.js"
+  // need to be resolved to the actual file on disk.
+  var vm = require('vm');
+  emglobal.importScripts = function (scriptPath: string) {
+    // Strip the PWORKER prefix and load from src/worker/
+    var resolved = scriptPath.replace(/^\.\.\/\.\.\//, '');
+    var fullPath = path.resolve(rootDir, resolved);
+    var code = fs.readFileSync(fullPath, 'utf-8');
+    noteGlueScript(fullPath);
+    vm.runInThisContext(code, fullPath);
+  };
+  ignoreGlueProcessHandlers();
+
+  // Suppress onmessage/postMessage (not used in Node mode)
+  emglobal.onmessage = null;
+  emglobal.postMessage = null;
+
+  // Set up the require function for WASM modules
+  setupRequireFunction();
+}

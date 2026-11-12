@@ -1,0 +1,1058 @@
+"use strict";
+/*
+ * Tool metadata registry.
+ *
+ * Single source of truth for declarative (data-only) metadata about every
+ * build tool, keyed by tool id. Both the IDE (src/ide) and the worker
+ * (src/worker) import this module.
+ *
+ * What lives here:
+ *   - extension -> tool selection hints
+ *   - editor (CodeMirror) styles and help URLs        (was TOOL_TO_SOURCE_STYLE/HELPURL in src/ide/ui.ts)
+ *   - preload filesystem names per platform            (was TOOL_PRELOADFS in src/worker/workertools.ts)
+ *   - wasm module names                                (was loadNative() args in src/worker/tools/*.ts)
+ *   - include/link dependency patterns                 (was parseIncludeDependencies in src/ide/project.ts)
+ *   - remote/server tool config                        (was ServerBuildTool in src/worker/server/buildenv.ts)
+ *
+ * What stays OUT of this module (behavior cannot cross the worker boundary):
+ *   - build functions (src/worker/workertools.ts `TOOLS` map)
+ *   - error matchers, listing parsers (src/worker/tools/*.ts)
+ *   - machine layout params (code_start, rom_size, ... -> src/worker/platforms.ts PLATFORM_PARAMS)
+ *
+ * A unit test cross-checks that every id in TOOL_META has a worker build fn
+ * (unless noWorkerBuild) and vice versa.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.URUST_PLATFORM_NAMES = exports.TOOL_META = exports.SDCC_DEFAULT_VERSION = exports.URUST_DOCS_URL = exports.URUST_INCLUDE_PATTERNS = exports.DIALOG_INCLUDE_PATTERNS = exports.ECS_INCLUDE_PATTERNS = exports.WIZ_INCLUDE_PATTERNS = exports.ACME_INCLUDE_PATTERNS = exports.USE_ASM_INCLUDE_PATTERNS = exports.SYSTEM_INCLUDE_PATTERNS = exports.VERILOG_INCLUDE_PATTERNS = exports.SHARED_LINK_PATTERNS = exports.OSCAR64_INCLUDE_PATTERNS = exports.DASM_INCLUDE_PATTERNS = exports.SHARED_INCLUDE_PATTERNS = exports.SHARED_RESOURCE_PATTERNS = exports.URUST_RS8_MODULES = exports.URUST_RS8_CHILDREN = void 0;
+exports.getSystemIncludePatterns = getSystemIncludePatterns;
+exports.scanRs8UseGroups = scanRs8UseGroups;
+exports.urustErrorDocURL = urustErrorDocURL;
+exports.getToolMeta = getToolMeta;
+exports.getPlatformToolHelpURL = getPlatformToolHelpURL;
+exports.getToolHelpURL = getToolHelpURL;
+exports.getToolMetaForFilename = getToolMetaForFilename;
+exports.getPlatformToolConfig = getPlatformToolConfig;
+exports.getPreloadFSName = getPreloadFSName;
+exports.getSkeletonName = getSkeletonName;
+exports.urustPlatformName = urustPlatformName;
+exports.getToolVersionLabel = getToolVersionLabel;
+exports.getIncludePatterns = getIncludePatterns;
+exports.defineArgs = defineArgs;
+exports.linkSymbolArgs = linkSymbolArgs;
+exports.extraArgsFor = extraArgsFor;
+exports.getLinkPatterns = getLinkPatterns;
+exports.getCompileLinkedSources = getCompileLinkedSources;
+exports.getIncludeDirs = getIncludeDirs;
+exports.getSharedFileSystemName = getSharedFileSystemName;
+exports.matchDependencyPatterns = matchDependencyPatterns;
+const util_1 = require("./util");
+const urustmods_1 = require("./urustmods");
+Object.defineProperty(exports, "URUST_RS8_CHILDREN", { enumerable: true, get: function () { return urustmods_1.URUST_RS8_CHILDREN; } });
+Object.defineProperty(exports, "URUST_RS8_MODULES", { enumerable: true, get: function () { return urustmods_1.URUST_RS8_MODULES; } });
+//// shared dependency-parsing patterns (from src/ide/project.ts)
+// C / most assemblers: [.#%]?include|incbin|embed "file", //#resource "file"
+// The resource form is also useful to tools whose own include syntax has no
+// way to name a non-source file (e.g. urust's custom board TOML).
+exports.SHARED_RESOURCE_PATTERNS = [
+    /^\s*([;']|[/][/])#(resource)\s+"(.+?)"/gm,
+];
+exports.SHARED_INCLUDE_PATTERNS = [
+    /^\s*[.#%]?(include|incbin|embed)\s+"(.+?)"/gmi,
+    ...exports.SHARED_RESOURCE_PATTERNS,
+];
+// dasm accepts include/incbin file names without quotes as well as quoted
+// ones (v_include() -> getfilename()), e.g. `INCLUDE VCS.h`. The shared pattern
+// only matches the quoted form, so scan the unquoted form here too; the
+// character class excludes a leading quote so quoted names stay with the
+// shared pattern (and dasm allows a leading dot on pseudo-ops, e.g. .include).
+exports.DASM_INCLUDE_PATTERNS = [
+    ...exports.SHARED_INCLUDE_PATTERNS,
+    /^\s*[.]?(include|incbin)\s+([^\s;"]+)/gmi,
+];
+// oscar64: #pragma compile("file.c") pulls another source file into the build
+// (the compiler's equivalent of a link). The compiler handles it itself, so the
+// file just has to be a build dependency copied into the tool filesystem.
+exports.OSCAR64_INCLUDE_PATTERNS = [
+    ...exports.SHARED_INCLUDE_PATTERNS,
+    /^\s*#pragma\s+compile\s*\(\s*"([^"]+)"\s*\)/gmi,
+];
+// C / most assemblers: //#link "file" (or ;link)
+exports.SHARED_LINK_PATTERNS = [
+    /^\s*([;]|[/][/])#link\s+"(.+?)"/gm,
+];
+// Verilog family: `include/.include, $include/$dofile/$write_image_in_table,
+// .arch json, $readmem[bh]
+exports.VERILOG_INCLUDE_PATTERNS = [
+    /^\s*(`include|[.]include)\s+"(.+?)"/gmi,
+    /^\s*\$(include|\$dofile|\$write_image_in_table)\('(.+?)'/gmi,
+    { re: /^\s*([.]arch)\s+(\w+)/gmi, suffix: '.json' },
+    /\$readmem[bh]\("(.+?)"/gmi,
+];
+// C system includes: #include <file.h> -- resolved from the toolchain
+// preload filesystem rather than the project. Deliberately NOT part of
+// SHARED_INCLUDE_PATTERNS, so build dependency scanning skips them.
+exports.SYSTEM_INCLUDE_PATTERNS = [
+    { re: /^\s*[.#%]?\s*include\s+<(.+?)>/gmi, system: true },
+];
+/**
+ * System include patterns (#include <foo.h>) for UI linking, for tools that
+ * have a bundled filesystem to search. Empty otherwise.
+ */
+function getSystemIncludePatterns(tool) {
+    let meta = tool && getToolMeta(tool);
+    return (meta && meta.includeDirs && meta.includeDirs.length) ? exports.SYSTEM_INCLUDE_PATTERNS : [];
+}
+// xasm6809 (USE) and merlin32 (ASM): "  USE file.ext"
+exports.USE_ASM_INCLUDE_PATTERNS = [
+    /^\s+(USE|ASM)\s+(\S+[.]\S+)/gm,
+];
+// acme: !src "file"
+exports.ACME_INCLUDE_PATTERNS = [
+    /^[!]src\s+"(.+?)"/gmi,
+];
+// wiz: import "file"; (implicit .wiz extension) / embed "file";
+exports.WIZ_INCLUDE_PATTERNS = [
+    { re: /^\s*import\s*"(.+?)";/gmi, suffix: '.wiz' },
+    /^\s*embed\s*"(.+?)";/gmi,
+];
+// ecs: import "file"
+exports.ECS_INCLUDE_PATTERNS = [
+    /^\s*(import)\s*"(.+?)"/gmi,
+];
+// dialog: %% #include "file" (comment directive)
+exports.DIALOG_INCLUDE_PATTERNS = [
+    /^\s*%%\s*#include\s+"(.+?)"/gm,
+];
+// urust: include_bytes!("file") and include_str!("file"); the path is relative
+// to the including source file, like the other tools' include directives.
+// `mod foo;` pulls in foo.rs (or foo/mod.rs) beside the including file, the
+// way rustc resolves a module, so those files ride along as includes. `use
+// foo::...;` only names a module `mod` already declared; it is still scanned
+// so the editor can link it. The rs8 register modules resolve to the sources
+// shipped in urust-fs.zip (see the tool's includeDirs): urust splices them in
+// from its .wasm, so they're copied out again for the editor to read; path
+// keywords (self/super/crate) stay out. urust loads modules itself -- no
+// separate link step is involved.
+const URUST_MOD_PATTERN = /^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/gm;
+// The module/child table is generated from the zip the editor can open
+// (scripts/urustmods.mjs -> src/common/urustmods.ts); test/unit/testurust.ts
+// checks it against the zip both ways, so a module urust adds cannot go
+// unlisted. `rs8::lib` is the crate root, not a module a program can name.
+const URUST_RS8_MODULE_PATTERN = new RegExp(`\\brs8::(${urustmods_1.URUST_RS8_MODULES.join('|')})(?:::([A-Za-z_][A-Za-z0-9_]*))?\\b`, 'g');
+// A `use` names the module (or one of its children) and then the items it
+// wants; only the module path becomes a file. A lowercase item after the
+// module (rs8::math::sin) stays with the module unless it is a known child.
+const URUST_RS8_MODULE = {
+    re: URUST_RS8_MODULE_PATTERN,
+    group: 1,
+    suffix: '.rs',
+    transform: (name, m) => {
+        const child = m[2];
+        return child && (urustmods_1.URUST_RS8_CHILDREN[name] || []).includes(child) ? name + '/' + child : name;
+    },
+};
+/**
+ * The modules a `use rs8::{ .. }` group names, with each item's offset in
+ * `text`. One regex match cannot enumerate a group's items, so this walks the
+ * braces (nested groups included) and applies the same rule as the
+ * single-path pattern: `{io, reset}` is `io.rs` (`reset` is an item, not a
+ * module), and `{c64::util, nes::{console, X}}` is `c64/util.rs`,
+ * `nes/console.rs` and `nes.rs` (`X` stays with its module).
+ */
+function scanRs8UseGroups(text) {
+    const out = [];
+    const opener = /\brs8::\s*\{/g;
+    let m;
+    while ((m = opener.exec(text))) {
+        const open = m.index + m[0].length - 1; // the '{'
+        const end = scanRs8Group(text, open + 1, [], out);
+        opener.lastIndex = Math.max(opener.lastIndex, end);
+    }
+    return out;
+}
+/** Walk one `{ .. }` group's items; returns the offset just past its `}`. */
+function scanRs8Group(text, i, prefix, out) {
+    let segs = [];
+    let start = i;
+    const emit = () => {
+        const path = prefix.concat(segs);
+        segs = [];
+        const module = path[0];
+        const child = path[1];
+        if (!module || !urustmods_1.URUST_RS8_MODULES.includes(module))
+            return;
+        const known = child && (urustmods_1.URUST_RS8_CHILDREN[module] || []).includes(child);
+        out.push({ index: start, name: known ? module + '/' + child + '.rs' : module + '.rs' });
+    };
+    while (i < text.length) {
+        const c = text[i];
+        if (c === ',') {
+            emit();
+            i++;
+            start = i;
+            continue;
+        }
+        if (c === '}') {
+            emit();
+            return i + 1;
+        }
+        if (c === '{') {
+            i = scanRs8Group(text, i + 1, prefix.concat(segs), out);
+            segs = [];
+            start = i;
+            continue;
+        }
+        if (c === '/' || c === '*') {
+            i++;
+            continue;
+        } // `::` slashes, a glob
+        const id = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(i));
+        if (!id) {
+            i++;
+            continue;
+        }
+        if (!segs.length)
+            start = i;
+        segs.push(id[0]);
+        i += id[0].length;
+    }
+    return i;
+}
+exports.URUST_INCLUDE_PATTERNS = [
+    /\binclude_(?:bytes|str)!\s*\(\s*"(.+?)"\s*\)/g,
+    ...exports.SHARED_RESOURCE_PATTERNS,
+    { re: URUST_MOD_PATTERN, suffix: '.rs' },
+    { re: URUST_MOD_PATTERN, suffix: '/mod.rs' },
+    URUST_RS8_MODULE,
+    { re: /^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+(?!self\b|super\b|crate\b|rs8\b)([A-Za-z_][A-Za-z0-9_]*)\s*::/gm, suffix: '.rs' },
+    // `use rs8::{io, reset};` -- every item of the group, nested groups too
+    { scan: scanRs8UseGroups },
+];
+/** urust's published documentation (an mdBook build). */
+exports.URUST_DOCS_URL = 'https://8bitworkshop.com/docs/urust/';
+/**
+ * URL for an urust error topic (`topic` in `--error-format json`) in the
+ * published docs, or undefined when the topic is missing or malformed. The
+ * slugs are stable and the mdBook headings carry them as explicit anchors.
+ */
+function urustErrorDocURL(topic) {
+    if (!topic || !/^[A-Za-z0-9_-]+$/.test(topic))
+        return undefined;
+    return `${exports.URUST_DOCS_URL}reference/errors.html#${topic}`;
+}
+//// preload filesystem names per tool/platform (was TOOL_PRELOADFS)
+/**
+ * Platform-specific documentation pages, keyed by tool id then platform id.
+ * These override the tool's generic `helpURL` on that platform -- e.g. cc65
+ * publishes an Atari-specific manual page at /doc/atari.html. Only tools with
+ * a platform-specific page need an entry here; everything else falls back to
+ * ToolMeta.helpURL.
+ */
+const TOOL_PLATFORM_HELPURL = {
+    cc65: {
+        apple2: 'https://cc65.github.io/doc/apple2.html',
+        atari8: 'https://cc65.github.io/doc/atari.html',
+        c64: 'https://cc65.github.io/doc/c64.html',
+        nes: 'https://cc65.github.io/doc/nes.html',
+        pce: 'https://cc65.github.io/doc/pce.html',
+        vic20: 'https://cc65.github.io/doc/vic20.html',
+        lynx: 'https://cc65.github.io/doc/lynx.html',
+    },
+};
+/**
+ * Which SDCC a program gets unless it says `//#tooldef c sdcc=3|4`. To make
+ * 4.x the default, change this to 4: nothing else needs editing.
+ *   3 = 3.6.5, Emscripten, preloadFS 'sdcc' (builds several times faster)
+ *   4 = 4.x, WASI, sdcc-fs.zip (smaller code)
+ */
+exports.SDCC_DEFAULT_VERSION = 3;
+/**
+ * 'default' lists both filesystems; the one for SDCC_DEFAULT_VERSION leads
+ * (getSharedFileSystemName prefers preloadFS). Platforms whose prebuilt
+ * libraries were compiled by SDCC 3.x (libcv, gb.lib, cpctelera) have only
+ * preloadFS: 4.x's default calling convention, sdcccall(1), can't call them.
+ */
+const SDCC_FS = {
+    'default': exports.SDCC_DEFAULT_VERSION === 3
+        ? { preloadFS: 'sdcc', wasiFSZip: 'sdcc-fs.zip' }
+        : { wasiFSZip: 'sdcc-fs.zip' },
+    'coleco': { preloadFS: 'sdcc' },
+    'msx-libcv': { preloadFS: 'sdcc' },
+    'sms': { preloadFS: 'sdcc' },
+    'gb': { preloadFS: 'sdcc' },
+    'cpc': { preloadFS: 'sdcc' },
+};
+const CC65_WASIFS = {
+    'apple2': { wasiFSZip: 'cc65-fs-apple2.zip' },
+    'c64': { wasiFSZip: 'cc65-fs-c64.zip' },
+    'vic20': { wasiFSZip: 'cc65-fs-vic20.zip' },
+    'nes': { wasiFSZip: 'cc65-fs-nes.zip' },
+    'atari8': { wasiFSZip: 'cc65-fs-atari8.zip' },
+    'vector': { wasiFSZip: 'cc65-fs-none.zip' },
+    'atari7800': { wasiFSZip: 'cc65-fs-none.zip' },
+    'devel': { wasiFSZip: 'cc65-fs-none.zip' },
+    'vcs': { wasiFSZip: 'cc65-fs-atari2600.zip' },
+    'pce': { wasiFSZip: 'cc65-fs-pce.zip' },
+    'exidy': { wasiFSZip: 'cc65-fs-none.zip' },
+};
+//// tool registry
+exports.TOOL_META = {
+    // ---- 6502 assemblers ----
+    dasm: {
+        id: 'dasm', name: 'DASM', kind: 'assembler', arch: '6502',
+        extensions: ['.dasm'],
+        editorStyle: '6502',
+        helpURL: 'https://raw.githubusercontent.com/dasm-assembler/dasm/refs/tags/v2.20.17/docs/dasm.txt',
+        wasmModule: 'dasm-wasisdk',
+        version: '2.20.17',
+        includePatterns: exports.DASM_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    acme: {
+        id: 'acme', name: 'ACME', kind: 'assembler', arch: '6502',
+        extensions: ['.acme'],
+        editorStyle: '6502',
+        helpURL: 'https://raw.githubusercontent.com/8bitworkshop/acme/main/docs/QuickRef.txt',
+        wasmModule: 'acme',
+        version: '0.97.1',
+        includePatterns: [...exports.SHARED_INCLUDE_PATTERNS, ...exports.ACME_INCLUDE_PATTERNS],
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    xa: {
+        id: 'xa', name: 'XA', kind: 'assembler', arch: '6502',
+        extensions: ['.xa'],
+        editorStyle: '6502',
+        helpURL: 'https://www.floodgap.com/retrotech/xa/',
+        wasmModule: 'xa',
+        version: '2.4.1',
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    nesasm: {
+        id: 'nesasm', name: 'NESASM', kind: 'assembler', arch: '6502',
+        extensions: ['.nesasm'],
+        editorStyle: '6502',
+        helpURL: 'https://github.com/camsaul/nesasm',
+        wasmModule: 'nesasm',
+        version: '3.1',
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    merlin32: {
+        id: 'merlin32', name: 'Merlin 32', kind: 'assembler', arch: '6502',
+        extensions: ['.lnk'],
+        editorStyle: '6502',
+        helpURL: 'https://github.com/apple2accumulator/merlin32',
+        wasmModule: 'merlin32',
+        version: '1.1.1',
+        includePatterns: [...exports.SHARED_INCLUDE_PATTERNS, ...exports.USE_ASM_INCLUDE_PATTERNS],
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    // ---- cc65 toolchain ----
+    cc65: {
+        id: 'cc65', name: 'cc65', kind: 'compiler', arch: '6502',
+        extensions: ['.c', '.h'],
+        includeDirs: ['/share/cc65/include', '/share/cc65/asminc'],
+        editorStyle: 'text/x-csrc',
+        helpURL: 'https://cc65.github.io/doc/cc65.html',
+        wasmModule: 'cc65',
+        version: '2.19',
+        defineFlag: '-D', defineInline: true,
+        platforms: CC65_WASIFS,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    ca65: {
+        id: 'ca65', name: 'ca65', kind: 'assembler', arch: '6502',
+        extensions: ['.s', '.ca65', '.inc'],
+        includeDirs: ['/share/cc65/include', '/share/cc65/asminc'],
+        editorStyle: '6502',
+        helpURL: 'https://cc65.github.io/doc/ca65.html',
+        wasmModule: 'ca65',
+        version: '2.19',
+        defineFlag: '-D', defineInline: false,
+        platforms: CC65_WASIFS,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    ld65: {
+        id: 'ld65', name: 'ld65', kind: 'linker', arch: '6502',
+        extensions: [],
+        wasmModule: 'ld65',
+        version: '2.19',
+        linkSymbolFlag: '-D', linkSymbolInline: false,
+    },
+    // ---- SDCC toolchain (z80) ----
+    sdcc: {
+        id: 'sdcc', name: 'SDCC', kind: 'compiler', arch: 'z80',
+        extensions: ['.c', '.h', '.sdcc'],
+        includeDirs: ['/share/sdcc/include', '/include'],
+        editorStyle: 'text/x-csrc',
+        helpURL: 'http://sdcc.sourceforge.net/doc/sdccman.pdf',
+        wasmModule: 'sdcc4',
+        version: exports.SDCC_DEFAULT_VERSION === 3 ? '3.6.5' : '4.6.0',
+        versionAlt: exports.SDCC_DEFAULT_VERSION === 3 ? '4.6.0' : '3.6.5',
+        defineFlag: '-D', defineInline: true,
+        platforms: SDCC_FS,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    sdasz80: {
+        id: 'sdasz80', name: 'sdasz80', kind: 'assembler', arch: 'z80',
+        extensions: ['.s'],
+        includeDirs: ['/share/sdcc/include', '/include'],
+        editorStyle: 'z80',
+        wasmModule: 'sdasz80-4',
+        version: '05.50.4+',
+        platforms: SDCC_FS,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    sdasgb: {
+        id: 'sdasgb', name: 'sdasgb', kind: 'assembler', arch: 'gbz80',
+        extensions: ['.sgb'],
+        includeDirs: ['/include'],
+        editorStyle: 'z80',
+        wasmModule: 'sdasgb',
+        platforms: { default: { preloadFS: 'sdcc' } },
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    sdldz80: {
+        id: 'sdldz80', name: 'sdldz80', kind: 'linker', arch: 'z80',
+        extensions: [],
+        wasmModule: 'sdld4',
+        version: '05.50.4-',
+        linkSymbolFlag: '-g', linkSymbolInline: false,
+    },
+    // SDCC 4.x mos6502 backend (compile with `-sdcc.c`); sdld6808 is the
+    // 6502 personality of the sdld4 binary
+    sdas6500: {
+        id: 'sdas6500', name: 'sdas6500', kind: 'assembler', arch: '6502',
+        extensions: [],
+        wasmModule: 'sdas6500',
+        version: '05.50.4+',
+        platforms: SDCC_FS,
+    },
+    sdld6808: {
+        id: 'sdld6808', name: 'sdld6808', kind: 'linker', arch: '6502',
+        extensions: [],
+        wasmModule: 'sdld4',
+        version: '05.50.4-',
+        linkSymbolFlag: '-g', linkSymbolInline: false,
+    },
+    sccz80: {
+        id: 'sccz80', name: 'sccz80', kind: 'compiler', arch: 'z80',
+        extensions: ['.scc'],
+        platforms: { default: { preloadFS: 'sccz80' } },
+        noWorkerBuild: true,
+    },
+    naken: {
+        id: 'naken', name: 'Naken', kind: 'assembler',
+        extensions: ['.ns'],
+        helpURL: 'https://github.com/mikeakohn/naken_asm',
+        noWorkerBuild: true,
+    },
+    // ---- z80 assemblers ----
+    zmac: {
+        id: 'zmac', name: 'zmac', kind: 'assembler', arch: 'z80',
+        extensions: ['.z'],
+        editorStyle: 'z80',
+        helpURL: 'https://raw.githubusercontent.com/8bitworkshop/zmac/master/doc.txt',
+        wasmModule: 'zmac',
+        version: '28jul2018',
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    jsasm: {
+        id: 'jsasm', name: 'JSASM', kind: 'assembler',
+        extensions: ['.asm'],
+        editorStyle: 'z80',
+        // pure JS assembler, no wasm module. Only used on the verilog platform,
+        // where .asm files pull in .v modules and name a CPU with '.arch'.
+        includePatterns: exports.VERILOG_INCLUDE_PATTERNS,
+        linkPatterns: [],
+    },
+    // ---- 6809 toolchain ----
+    xasm6809: {
+        id: 'xasm6809', name: 'XASM6809', kind: 'assembler', arch: '6809',
+        extensions: ['.xasm'],
+        editorStyle: '6809',
+        wasmModule: 'xasm6809',
+        includePatterns: [...exports.SHARED_INCLUDE_PATTERNS, ...exports.USE_ASM_INCLUDE_PATTERNS],
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    cmoc: {
+        id: 'cmoc', name: 'CMOC', kind: 'compiler', arch: '6809',
+        extensions: ['.c', '.h'],
+        // NOTE: no bundled filesystem -- the compiler passes -I/share/include but
+        // never mounts one, so system headers can't be linked in the UI
+        editorStyle: 'text/x-csrc',
+        helpURL: 'https://github.com/stahta01/cmoc/',
+        wasmModule: 'cmoc',
+        version: '0.1.67',
+        defineFlag: '-D', defineInline: false,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    lwasm: {
+        id: 'lwasm', name: 'LWASM', kind: 'assembler', arch: '6809',
+        extensions: ['.lwasm'],
+        editorStyle: '6809',
+        wasmModule: 'lwasm',
+        version: '4.17',
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    lwlink: {
+        id: 'lwlink', name: 'LWLINK', kind: 'linker', arch: '6809',
+        extensions: [],
+        wasmModule: 'lwlink',
+        version: '4.17',
+    },
+    // ---- ARM ----
+    vasmarm: {
+        id: 'vasmarm', name: 'vasm (ARM)', kind: 'assembler', arch: 'arm32',
+        extensions: ['.vasm'],
+        editorStyle: 'vasm',
+        wasmModule: 'vasmarm_std',
+        version: '1.8k',
+        defineFlag: '-D', defineInline: false,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    armips: {
+        id: 'armips', name: 'armips', kind: 'assembler', arch: 'arm32',
+        extensions: ['.armips'],
+        editorStyle: 'vasm',
+        wasmModule: 'armips',
+        version: '0.11.0',
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    armtcc: {
+        id: 'armtcc', name: 'TCC (ARM)', kind: 'compiler', arch: 'arm32',
+        extensions: ['.c', '.s'],
+        includeDirs: ['/include'],
+        wasiFSZip: 'arm32-fs.zip',
+        editorStyle: 'text/x-csrc',
+        wasmModule: 'arm-tcc',
+        defineFlag: '-D', defineInline: false,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    armtcclink: {
+        id: 'armtcclink', name: 'TCC (ARM) link', kind: 'linker', arch: 'arm32',
+        extensions: [],
+        wasmModule: 'arm-tcc',
+    },
+    // ---- x86 ----
+    smlrc: {
+        id: 'smlrc', name: 'SmallerC', kind: 'compiler', arch: 'x86',
+        extensions: ['.c'],
+        helpURL: 'https://github.com/alexfru/SmallerC/blob/master/v0100/doc/smlrc.md',
+        // NOTE: no bundled filesystem and no -I arg -- no headers to link in the UI
+        editorStyle: 'text/x-csrc',
+        wasmModule: 'smlrc',
+        defineFlag: '-D', defineInline: false,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    yasm: {
+        id: 'yasm', name: 'YASM', kind: 'assembler', arch: 'x86',
+        extensions: ['.asm'],
+        editorStyle: 'gas',
+        helpURL: 'https://www.tortall.net/projects/yasm/manual/html/manual.html',
+        wasmModule: 'yasm',
+        version: '1.3.0',
+        defineFlag: '-D', defineInline: false,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    // ---- 6502 C compilers / BASIC dialects ----
+    oscar64: {
+        id: 'oscar64', name: 'Oscar64', kind: 'compiler', arch: '6502',
+        extensions: ['.c', '.cpp', '.cc', '.o64'],
+        includeDirs: ['/include'],
+        wasiFSZip: 'oscar64-fs.zip',
+        editorStyle: 'text/x-csrc',
+        helpURL: 'https://github.com/drmortalwombat/oscar64/blob/v1.32.266/oscar64.md',
+        defineFlag: '-d', defineInline: true,
+        wasmModule: 'oscar64',
+        version: '1.32.266',
+        includePatterns: exports.OSCAR64_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+        compileLinkedSources: true,
+        platforms: {
+            // oscar64 defaults to the C64 target machine
+            c64: {},
+            atari8: { buildArgs: { compiler: ['-tm=atari'] } },
+            nes: { buildArgs: { compiler: ['-tm=nes'] } },
+        },
+    },
+    bataribasic: {
+        id: 'bataribasic', name: 'batari Basic', kind: 'compiler', arch: '6502',
+        extensions: ['.bb', '.bas'],
+        includeDirs: ['/includes'],
+        editorStyle: 'bataribasic',
+        helpURL: 'help/bataribasic/manual.html',
+        wasiFSZip: 'bb-fs.zip',
+        platforms: { default: {} },
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    fastbasic: {
+        id: 'fastbasic', name: 'FastBasic', kind: 'compiler', arch: '6502',
+        extensions: ['.bas', '.fb', '.fbi'],
+        editorStyle: 'fastbasic',
+        helpURL: 'https://github.com/dmsc/fastbasic/blob/v4.4/manual.md',
+        wasmModule: 'fastbasic-int',
+        version: '4.4',
+        platforms: { default: { wasiFSZip: 'cc65-fs-atari8.zip' } },
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    cvbasic: {
+        id: 'cvbasic', name: 'CVBasic', kind: 'compiler',
+        extensions: ['.bas'],
+        editorStyle: 'basic',
+        helpURL: 'https://github.com/nanochess/CVBasic/blob/master/manual.txt',
+        wasmModule: 'cvbasic',
+        version: '0.9.2',
+        defineFlag: '-D',
+        defineInline: true,
+        wasiFSZip: 'cvbasic-fs.zip',
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    cc2600: {
+        id: 'cc2600', name: 'CC2600', kind: 'compiler', arch: '6502',
+        extensions: ['.cc2600'],
+        editorStyle: 'text/x-csrc',
+        helpURL: 'https://github.com/steux/cc2600',
+        wasmModule: 'cc2600',
+        version: '0.4.5',
+        wasiFSZip: 'cc2600-fs.zip',
+        includeDirs: ['/headers'],
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    cc7800: {
+        id: 'cc7800', name: 'CC7800', kind: 'compiler', arch: '6502',
+        extensions: ['.cc7800', '.c78'],
+        editorStyle: 'text/x-csrc',
+        helpURL: 'https://github.com/steux/cc7800',
+        wasmModule: 'cc7800',
+        version: '0.2.28',
+        wasiFSZip: 'cc7800-fs.zip',
+        includeDirs: ['/headers'],
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+    },
+    // ---- other languages ----
+    basic: {
+        id: 'basic', name: 'BASIC', kind: 'interpreter',
+        extensions: ['.bas'],
+        editorStyle: 'basic',
+    },
+    wiz: {
+        id: 'wiz', name: 'wiz', kind: 'compiler',
+        extensions: ['.wiz'],
+        includeDirs: ['/common/$platform'],
+        editorStyle: 'text/x-wiz',
+        helpURL: 'https://github.com/wiz-lang/wiz/blob/master/readme.md#wiz',
+        wasmModule: 'wiz',
+        version: '0.1.2',
+        platforms: { default: { preloadFS: 'wiz' } },
+        includePatterns: exports.WIZ_INCLUDE_PATTERNS,
+    },
+    ecs: {
+        id: 'ecs', name: 'ECS', kind: 'assembler', arch: '6502',
+        extensions: ['.ecs'],
+        editorStyle: 'ecs',
+        platforms: {
+            vcs: { wasiFSZip: 'cc65-fs-atari2600.zip' },
+            nes: { wasiFSZip: 'cc65-fs-nes.zip' },
+            c64: { wasiFSZip: 'cc65-fs-c64.zip' },
+        },
+        includePatterns: [...exports.SHARED_INCLUDE_PATTERNS, ...exports.ECS_INCLUDE_PATTERNS],
+    },
+    inform6: {
+        id: 'inform6', name: 'Inform 6', kind: 'compiler', arch: 'zmachine',
+        extensions: ['.inf'],
+        editorStyle: 'inform6',
+        wasmModule: 'inform',
+        version: '6.34',
+        platforms: { default: { preloadFS: 'inform' } },
+    },
+    dialog: {
+        id: 'dialog', name: 'Dialog', kind: 'compiler', arch: 'zmachine',
+        extensions: ['.dg'],
+        editorStyle: 'dialog',
+        helpURL: 'https://linusakesson.net/dialog/docs/',
+        wasmModule: 'dialogc',
+        // self-reported build tag, not a numeric release
+        version: '1c/03-dev',
+        wasiFSZip: 'dialog-fs.zip',
+        includeDirs: ['/'],
+        includePatterns: exports.DIALOG_INCLUDE_PATTERNS,
+    },
+    // Rust subset for 8-bit CPUs (github.com/sehugg/urust); one WASI binary
+    // builds for devel-6502, nes, c64, atari8, vcs, apple2, vic20 and
+    // zx-spectrum (see URUST_PLATFORM_NAMES below)
+    urust: {
+        id: 'urust', name: 'urust', kind: 'compiler', arch: '6502',
+        extensions: ['.rs'],
+        editorStyle: 'rust',
+        wasmModule: 'urust',
+        helpURL: exports.URUST_DOCS_URL,
+        version: '0.0.1',
+        // the compiler embeds the rs8 sources; ship them as a WASI filesystem so
+        // the editor can open them (view-only -- the build uses the embedded ones)
+        wasiFSZip: 'urust-fs.zip',
+        includeDirs: ['/rs8'],
+        includePatterns: exports.URUST_INCLUDE_PATTERNS,
+        platforms: {
+            zx: { buildArgs: { compiler: ['--format', 'z80'] } },
+        },
+    },
+    // ---- verilog / HDL ----
+    verilator: {
+        id: 'verilator', name: 'Verilator', kind: 'hdl', arch: 'verilog',
+        extensions: ['.v'],
+        editorStyle: 'verilog',
+        helpURL: 'https://verilator.org/guide/4.205/',
+        wasmModule: 'verilator_bin',
+        version: '4.205',
+        includePatterns: exports.VERILOG_INCLUDE_PATTERNS,
+        linkPatterns: [],
+    },
+    yosys: {
+        id: 'yosys', name: 'Yosys', kind: 'hdl', arch: 'verilog',
+        extensions: [],
+        wasmModule: 'yosys',
+        includePatterns: exports.VERILOG_INCLUDE_PATTERNS,
+        linkPatterns: [],
+    },
+    silice: {
+        id: 'silice', name: 'Silice', kind: 'hdl', arch: 'verilog',
+        extensions: ['.ice'],
+        editorStyle: 'verilog',
+        helpURL: 'https://github.com/sylefeb/Silice',
+        wasmModule: 'silice',
+        version: '0.1',
+        platforms: { default: { preloadFS: 'Silice' } },
+        includePatterns: exports.VERILOG_INCLUDE_PATTERNS,
+        linkPatterns: [],
+    },
+    // ---- remote / server ----
+    'llvm-mos': {
+        id: 'llvm-mos', name: 'LLVM-MOS', kind: 'compiler', arch: '6502',
+        extensions: ['.c', '.cpp', '.s', '.S', '.C'],
+        editorStyle: 'text/x-csrc', // used as 'remote:llvm-mos' in the IDE
+        helpURL: 'https://llvm-mos.org/wiki/Welcome',
+        remote: true,
+        includePatterns: exports.SHARED_INCLUDE_PATTERNS,
+        linkPatterns: exports.SHARED_LINK_PATTERNS,
+        server: {
+            version: 'latest',
+            platforms: ['atari8', 'c64', 'nes', 'pce', 'vcs'],
+            binpath: 'llvm-mos/bin',
+            command: 'mos-clang',
+            args: ['-Os', '-g', '-D', '__8BITWORKSHOP__', '-o', '$OUTFILE', '$INFILES'],
+        },
+    },
+    // TODO: do we need this too?
+    remote: {
+        id: 'remote', name: 'Remote build', kind: 'remote',
+        extensions: [],
+        remote: true,
+    },
+};
+//// helpers
+/**
+ * Look up tool metadata by tool id. Tolerates the 'remote:' transport prefix
+ * used in build steps (e.g. 'remote:llvm-mos' -> 'llvm-mos').
+ */
+function getToolMeta(id) {
+    return exports.TOOL_META[id.replace(/^remote:/, '')];
+}
+/**
+ * Platform-specific documentation page for a tool, or undefined if the tool
+ * only has a generic page. Suffixed platform ids resolve through their root
+ * base (e.g. 'atari8-800' -> 'atari8').
+ */
+function getPlatformToolHelpURL(tool, platform) {
+    let meta = getToolMeta(tool);
+    if (!meta || !platform)
+        return undefined;
+    let overrides = TOOL_PLATFORM_HELPURL[meta.id];
+    if (!overrides)
+        return undefined;
+    let url = overrides[platform];
+    if (!url) {
+        let base = (0, util_1.getRootBasePlatform)(platform);
+        if (base && base !== platform)
+            url = overrides[base];
+    }
+    return url;
+}
+/**
+ * Documentation URL for a tool on a platform. A platform-specific page (e.g.
+ * cc65's atari.html on atari8) wins over the tool's generic helpURL. Undefined
+ * if the tool has no docs at all.
+ */
+function getToolHelpURL(tool, platform) {
+    let meta = getToolMeta(tool);
+    if (!meta)
+        return undefined;
+    return (platform && getPlatformToolHelpURL(tool, platform)) || meta.helpURL;
+}
+/**
+ * Return all tools that consume the given filename (longest extension match
+ * first). Ambiguity is resolved by the platform, which picks from these.
+ */
+function getToolMetaForFilename(fn) {
+    let matches = [];
+    for (let id in exports.TOOL_META) {
+        let meta = exports.TOOL_META[id];
+        for (let ext of meta.extensions) {
+            if (ext && fn.endsWith(ext)) {
+                matches.push({ meta, len: ext.length });
+                break;
+            }
+        }
+    }
+    return matches.sort((a, b) => b.len - a.len).map(m => m.meta);
+}
+/**
+ * The per-platform ToolMeta config for a tool, resolving suffixed platform ids
+ * to their root base and falling back to 'default'. Used by the Builder to
+ * layer platform-level defines/buildArgs under source directives.
+ */
+function getPlatformToolConfig(tool, platform) {
+    let meta = tool && getToolMeta(tool);
+    if (!meta || !meta.platforms)
+        return undefined;
+    if (platform) {
+        let p = meta.platforms[platform];
+        if (p)
+            return p;
+        let base = (0, util_1.getRootBasePlatform)(platform);
+        if (base && base !== platform && meta.platforms[base])
+            return meta.platforms[base];
+    }
+    return meta.platforms['default'];
+}
+/**
+ * Resolve the preload filesystem name for a tool on a platform
+ * (was TOOL_PRELOADFS, including compound 'tool-platform' keys).
+ */
+function getPreloadFSName(tool, platform) {
+    let meta = getToolMeta(tool);
+    if (!meta)
+        return undefined;
+    if (meta.platforms) {
+        if (platform) {
+            // Try the exact id, then the root base id so suffixed platform ids
+            // (e.g. 'atari8-800', 'atari8-5200.xlmame') resolve to the shared
+            // filesystem registered under the root (e.g. 'atari8-800' -> 'atari8').
+            let p = meta.platforms[platform];
+            if (p && p.preloadFS)
+                return p.preloadFS;
+            let base = (0, util_1.getRootBasePlatform)(platform);
+            if (base && base !== platform) {
+                let b = meta.platforms[base];
+                if (b && b.preloadFS)
+                    return b.preloadFS;
+            }
+        }
+        let d = meta.platforms['default'];
+        if (d && d.preloadFS)
+            return d.preloadFS;
+    }
+    return undefined;
+}
+/** Skeleton filename in presets/<platform>/, defaults to tool id. */
+function getSkeletonName(tool) {
+    let meta = getToolMeta(tool);
+    return (meta && meta.skeleton) ? meta.skeleton : tool.replace(/^remote:/, '');
+}
+/**
+ * urust's `--platform` names that differ from the 8bitworkshop platform root
+ * (the id without a `.emulator` suffix or a `-specialization`). A root not in
+ * this map or in URUST_PASSTHROUGH_ROOTS has no urust target, even though .rs
+ * selects urust on every 6502/Z80 platform (see toolselect.ts).
+ */
+exports.URUST_PLATFORM_NAMES = {
+    'devel': 'devel-6502',
+    'zx': 'zx-spectrum',
+    'coleco': 'colecovision'
+};
+/** Platform roots urust targets under their own name. */
+const URUST_PASSTHROUGH_ROOTS = new Set([
+    'nes', 'c64', 'atari8', 'vcs', 'apple2', 'vic20', 'atari7800', 'msx', 'gb',
+]);
+/** urust's `--platform` name for an 8bitworkshop platform id, if it has one. */
+function urustPlatformName(platform) {
+    var root = (0, util_1.getRootBasePlatform)(platform);
+    if (exports.URUST_PLATFORM_NAMES[root])
+        return exports.URUST_PLATFORM_NAMES[root];
+    return URUST_PASSTHROUGH_ROOTS.has(root) ? root : undefined;
+}
+/**
+ * Version string for display, e.g. '3.6.5 (default) / 4.6.0' for SDCC or
+ * '—' when the tool has no recorded version.
+ */
+function getToolVersionLabel(meta) {
+    if (!meta || !meta.version)
+        return '—';
+    return meta.versionAlt ? meta.version + ' (default) / ' + meta.versionAlt : meta.version;
+}
+/**
+ * Include patterns to use when scanning a source file for dependencies.
+ * Falls back to the platform (verilog vs. everything else) when the tool is
+ * unknown or declares no patterns of its own, which is how dependency parsing
+ * worked before this registry. A tool that really has no include directives
+ * says so with an explicit empty list.
+ */
+function getIncludePatterns(tool, platform) {
+    let meta = tool && getToolMeta(tool);
+    if (meta && meta.includePatterns)
+        return meta.includePatterns;
+    if (platform && platform.startsWith('verilog'))
+        return exports.VERILOG_INCLUDE_PATTERNS;
+    return exports.SHARED_INCLUDE_PATTERNS;
+}
+/**
+ * Format a list of preprocessor/assembler defines as argv for a tool, using
+ * the flag and joining style declared in its ToolMeta. Returns [] when the
+ * tool has no command-line define mechanism (e.g. sdasz80).
+ */
+function defineArgs(tool, defines) {
+    let meta = tool && getToolMeta(tool);
+    if (!meta || !meta.defineFlag || !defines || !defines.length)
+        return [];
+    let out = [];
+    for (let d of defines) {
+        if (meta.defineInline)
+            out.push(meta.defineFlag + d);
+        else
+            out.push(meta.defineFlag, d);
+    }
+    return out;
+}
+/**
+ * Format link-time global symbols as argv for a linker tool, using the flag
+ * declared in its ToolMeta ('-D' for ld65, '-g' for sdldz80). Returns [] when
+ * the tool cannot define symbols on the command line.
+ */
+function linkSymbolArgs(tool, symbols) {
+    let meta = tool && getToolMeta(tool);
+    if (!meta || !meta.linkSymbolFlag || !symbols || !symbols.length)
+        return [];
+    let out = [];
+    for (let s of symbols) {
+        if (meta.linkSymbolInline)
+            out.push(meta.linkSymbolFlag + s);
+        else
+            out.push(meta.linkSymbolFlag, s);
+    }
+    return out;
+}
+/**
+ * Extra raw args from params.buildArgs for the phase matching the tool's kind
+ * (compiler/assembler/linker). Interpreter/hdl/remote tools get nothing.
+ */
+function extraArgsFor(tool, buildArgs) {
+    let meta = tool && getToolMeta(tool);
+    if (!meta || !buildArgs)
+        return [];
+    let kind = meta.kind;
+    if (kind === 'compiler' || kind === 'assembler' || kind === 'linker')
+        return buildArgs[kind] || [];
+    return [];
+}
+/** Link patterns ("//#link") to use when scanning a source file. */
+function getLinkPatterns(tool, platform) {
+    let meta = tool && getToolMeta(tool);
+    if (meta && meta.linkPatterns)
+        return meta.linkPatterns;
+    if (platform && platform.startsWith('verilog'))
+        return [];
+    return exports.SHARED_LINK_PATTERNS;
+}
+/**
+ * True if "//#link" dependencies are compiled together with the main source in
+ * one tool invocation (single-pass compilers like oscar64) rather than built
+ * separately and linked. The build message then carries them as `linkfiles`
+ * on the main step so the tool can pass them all to one invocation.
+ */
+function getCompileLinkedSources(tool) {
+    let meta = tool && getToolMeta(tool);
+    return !!(meta && meta.compileLinkedSources);
+}
+/**
+ * Directories containing shared code (headers etc.) for this tool's shared
+ * filesystem, e.g. ['/include','/asminc','/headers'] -- empty if none/unknown.
+ */
+function getIncludeDirs(tool, platform_id) {
+    platform_id = platform_id && (0, util_1.getRootBasePlatform)(platform_id);
+    let meta = tool && getToolMeta(tool);
+    let out = (meta && meta.includeDirs) || [];
+    out = out.map(s => s.replace('$platform', platform_id));
+    return out;
+}
+/**
+ * Name of the shared filesystem to query for this tool's bundled files:
+ * either the emscripten preloadFS package name (e.g. 'sdcc') or, for tools
+ * with a WASI filesystem zip (e.g. cc2600), 'wasi:<zipname>'.
+ * Undefined if the tool has no bundled filesystem.
+ */
+function getSharedFileSystemName(tool, platform) {
+    var fsName = getPreloadFSName(tool, platform);
+    if (fsName)
+        return fsName;
+    let config = getPlatformToolConfig(tool, platform);
+    if (config && config.wasiFSZip)
+        return 'wasi:' + config.wasiFSZip;
+    let meta = tool && getToolMeta(tool);
+    return (meta && meta.wasiFSZip) ? 'wasi:' + meta.wasiFSZip : undefined;
+}
+/**
+ * Run a set of include/link patterns over source text, returning the
+ * referenced filenames. The filename comes from the pattern's `group`, or
+ * from the last capture group if unspecified; `transform` may rewrite it, then
+ * any implicit `suffix` is added.
+ */
+function matchDependencyPatterns(text, patterns) {
+    let files = [];
+    let lines = text.split('\n');
+    for (let pat of patterns || []) {
+        let p = pat instanceof RegExp ? { re: pat } : pat;
+        if (p.re)
+            for (let line of lines) {
+                let m;
+                p.re.lastIndex = 0; // patterns are shared and global, so rewind first
+                // matched per line, not over the whole file, so the `^`+`m`+`g`
+                // anchored patterns don't make the regex engine recurse (on its
+                // native call stack) at every line of a large source file
+                while (m = p.re.exec(line)) {
+                    let fn = m[p.group != null ? p.group : m.length - 1];
+                    if (!fn)
+                        continue;
+                    if (p.transform)
+                        fn = p.transform(fn, m);
+                    files.push(p.suffix ? fn + p.suffix : fn);
+                }
+            }
+        // A scan enumerates what one match cannot (a brace group's items); its
+        // names are already final paths. One pass over the whole text, since a
+        // group may span lines.
+        if (p.scan)
+            for (let hit of p.scan(text))
+                files.push(hit.name);
+    }
+    return files;
+}
+//# sourceMappingURL=toolmeta.js.map

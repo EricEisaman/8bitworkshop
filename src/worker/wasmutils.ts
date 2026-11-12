@@ -1,0 +1,355 @@
+
+// WebAssembly module cache
+// for Emscripten-compiled functions
+
+import { BuildStep, PWORKER, cacheBust, endtime, starttime, putWorkFile, anyTargetChanged } from "./builder";
+
+/// <reference types="emscripten" />
+export interface EmscriptenModule {
+  callMain: (args: string[]) => void;
+  FS: any; // TODO
+}
+
+declare function importScripts(path: string);
+
+const ENVIRONMENT_IS_NODE = typeof process === 'object' && process != null &&
+  typeof process.versions === 'object' && process.versions != null &&
+  typeof process.versions.node === 'string';
+const ENVIRONMENT_IS_WORKER = typeof importScripts === 'function';
+const ENVIRONMENT_IS_WEB = typeof window === 'object';
+// Prefer the real Node global: tests sometimes install a jsdom `window`
+// before this module loads, and picking that would make setupNodeEnvironment
+// try to overwrite the read-only jsdom `window` property.
+export const emglobal: any = ENVIRONMENT_IS_NODE ? global : ENVIRONMENT_IS_WORKER ? self : ENVIRONMENT_IS_WEB ? window : global;
+
+// simple CommonJS module loader
+// TODO: relative paths for dependencies
+//
+// Use emglobal.exports rather than the module's own `exports` binding: Emscripten
+// glue loaded by importScripts writes to the global `exports`, and tsc compiles
+// this file as a CommonJS module, whose `exports` is a different object. (In a
+// test worker that loaded the unbundled modules first, the old code reassigned
+// that binding here and later require('path') calls failed.)
+if (!emglobal['require']) {
+  emglobal['require'] = (modpath: string) => {
+    if (modpath.endsWith('.js')) modpath = modpath.slice(-3);
+    var modname = modpath.split('/').slice(-1)[0];
+    var hasNamespace = emglobal[modname] != null;
+    console.log('@@@ require', modname, modpath, hasNamespace);
+    if (!hasNamespace) {
+      emglobal.exports = {};
+      importScripts(`${modpath}.js`);
+    }
+    if (emglobal[modname] == null) {
+      emglobal[modname] = emglobal.exports; // TODO: always put in global scope?
+    }
+    return emglobal[modname]; // TODO
+  }
+}
+
+// TODO: leaks memory even when disabled...
+var _WASM_module_cache = {};
+var CACHE_WASM_MODULES = true; // if false, use asm.js only
+
+// TODO: which modules need this?
+var wasmMemory;
+export function getWASMMemory() {
+  if (wasmMemory == null) {
+    wasmMemory = new WebAssembly.Memory({
+      'initial': 1024,  // 64MB
+      'maximum': 16384, // 1024MB
+    });
+  }
+  return wasmMemory;
+}
+export function getWASMBinary(module_id: string) {
+  return wasmBlob[module_id];
+}
+function getWASMModule(module_id: string) {
+  var module = _WASM_module_cache[module_id];
+  if (!module) {
+    starttime();
+    module = new WebAssembly.Module(wasmBlob[module_id]);
+    if (CACHE_WASM_MODULES) {
+      _WASM_module_cache[module_id] = module;
+      delete wasmBlob[module_id];
+    }
+    endtime("module creation " + module_id);
+  }
+  return module;
+}
+// function for use with instantiateWasm
+export function moduleInstFn(module_id: string) {
+  return function (imports, ri) {
+    var mod = getWASMModule(module_id);
+    var inst = new WebAssembly.Instance(mod, imports);
+    ri(inst);
+    return inst.exports;
+  }
+}
+
+export function execMain(step: BuildStep, mod, args: string[]) {
+  starttime();
+  var run = mod.callMain || mod.run; // TODO: run?
+  run(args);
+  endtime(step.tool);
+  console.log('exec', step.tool, args.join(' '));
+}
+
+/**
+ * Run main(), then store the named output file, optionally transforming it.
+ * Returns an error result when the tool reported errors, or null on success.
+ */
+export function execToFile(step: BuildStep, mod, args: string[], FS, destpath: string, errors,
+    processFn?: (s: string) => string) {
+  execMain(step, mod, args);
+  if (errors.length) return { errors: errors };
+  var out = FS.readFile(destpath, { encoding: 'utf8' });
+  if (processFn) out = processFn(out);
+  putWorkFile(destpath, out);
+  return null;
+}
+
+/** Read and store a binary output file; returns null if it did not change. */
+export function readBinaryOutput(step: BuildStep, FS, objpath: string): Uint8Array | null {
+  var objout = FS.readFile(objpath, { encoding: 'binary' }) as Uint8Array;
+  putWorkFile(objpath, objout);
+  if (!anyTargetChanged(step, [objpath])) return null;
+  return objout;
+}
+
+/// asm.js / WASM / filesystem loading
+
+export var fsMeta = {};
+var fsBlob = {};
+var wasmBlob = {};
+
+/**
+ * Wrap binary data in a Blob.
+ *
+ * We fetch filesystem packages as ArrayBuffers instead of Blobs: Firefox
+ * hangs on a synchronous XHR with responseType='blob' when the response is
+ * 1MB or more, and every toolchain package we ship is that big. Chrome is
+ * happy either way, so this keeps both browsers working.
+ *
+ * The Node test environment (workerlib.ts) has its own Blob shim, and
+ * installs a factory for it in emglobal.
+ */
+export function makeBlob(data: ArrayBuffer | Uint8Array): any {
+  var bytes: Uint8Array<ArrayBuffer>;
+  if (data instanceof Uint8Array) {
+    bytes = new Uint8Array(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
+  } else {
+    bytes = new Uint8Array(data);
+  }
+  var factory = (emglobal as any).makeBlob;
+  if (typeof factory == 'function') return factory(bytes);
+  return new Blob([bytes]);
+}
+
+/** Size in bytes of a loaded filesystem package's data (0 if not loaded). */
+export function getFilesystemSize(name: string): number {
+  var blob = fsBlob[name];
+  return blob ? blob.size : 0;
+}
+
+// load filesystems for CC65 and others asynchronously
+export function loadFilesystem(name: string) {
+  var xhr = new XMLHttpRequest();
+  xhr.responseType = 'arraybuffer';
+  xhr.open("GET", cacheBust(PWORKER + "fs/fs" + name + ".data"), false);  // synchronous request
+  xhr.send(null);
+  fsBlob[name] = makeBlob(xhr.response);
+  xhr = new XMLHttpRequest();
+  xhr.responseType = 'json';
+  xhr.open("GET", cacheBust(PWORKER + "fs/fs" + name + ".js.metadata"), false);  // synchronous request
+  xhr.send(null);
+  fsMeta[name] = xhr.response;
+  console.log("Loaded " + name + " filesystem", fsMeta[name].files.length, 'files', fsBlob[name].size, 'bytes');
+}
+
+var loaded = {};
+export function load(modulename: string, debug?: boolean) {
+  if (!loaded[modulename]) {
+    importScripts(cacheBust(PWORKER + 'asmjs/' + modulename + (debug ? "." + debug + ".js" : ".js")));
+    loaded[modulename] = 1;
+  }
+}
+export function loadWASMBinary(modulename: string) {
+  if (!loaded[modulename]) {
+    var xhr = new XMLHttpRequest();
+    xhr.responseType = 'arraybuffer';
+    xhr.open("GET", cacheBust(PWORKER + "wasm/" + modulename + ".wasm"), false);  // synchronous request
+    xhr.send(null);
+    if (xhr.response) {
+      wasmBlob[modulename] = new Uint8Array(xhr.response);
+      console.log("Loaded " + modulename + ".wasm (" + wasmBlob[modulename].length + " bytes)");
+      loaded[modulename] = 1;
+    } else {
+      throw Error("Could not load WASM file " + modulename + ".wasm");
+    }
+  }
+  return wasmBlob[modulename];
+}
+export function loadWASM(modulename: string, debug?: boolean) {
+  if (!loaded[modulename]) {
+    importScripts(cacheBust(PWORKER + "wasm/" + modulename + (debug ? "." + debug + ".js" : ".js")));
+    loadWASMBinary(modulename);
+  }
+}
+export function loadNative(modulename: string) {
+  // detect WASM
+  if (CACHE_WASM_MODULES && typeof WebAssembly === 'object') {
+    loadWASM(modulename);
+  } else {
+    load(modulename);
+  }
+}
+
+// mount the filesystem at /share
+export function setupFS(FS, name: string) {
+  var WORKERFS = FS.filesystems['WORKERFS'];
+  if (!fsMeta[name]) throw Error("No filesystem for '" + name + "'");
+  FS.mkdir('/share');
+  FS.mount(WORKERFS, {
+    packages: [{ metadata: fsMeta[name], blob: fsBlob[name] }]
+  }, '/share');
+  // fix for slow Blob operations by caching typed arrays
+  // https://github.com/kripken/emscripten/blob/incoming/src/library_workerfs.js
+  // https://bugs.chromium.org/p/chromium/issues/detail?id=349304#c30
+  var reader = WORKERFS.reader;
+  var blobcache = {};
+  WORKERFS.stream_ops.read = function (stream, buffer, offset, length, position) {
+    if (position >= stream.node.size) return 0;
+    var contents = blobcache[stream.path];
+    if (!contents) {
+      var ab = reader.readAsArrayBuffer(stream.node.contents);
+      contents = blobcache[stream.path] = new Uint8Array(ab);
+    }
+    if (position + length > contents.length)
+      length = contents.length - position;
+    for (var i = 0; i < length; i++) {
+      buffer[offset + i] = contents[position + i];
+    }
+    return length;
+  };
+}
+
+export var print_fn = function (s: string) {
+  console.log(s);
+  //console.log(new Error().stack);
+}
+
+/// shared code in filesystem packages (headers, asm includes, ...)
+
+export interface SharedFileEntry {
+  filename: string;
+  start: number;
+  end: number;
+}
+
+/** Make sure a filesystem package is loaded (synchronous XHR, worker-only). */
+export function ensureFilesystem(name: string) {
+  if (!fsMeta[name]) loadFilesystem(name);
+}
+
+/** Find an entry in the filesystem package metadata. */
+export function getSharedFileEntry(name: string, path: string): SharedFileEntry | null {
+  ensureFilesystem(name);
+  let meta = fsMeta[name];
+  if (!meta || !meta.files) return null;
+  for (let f of meta.files) {
+    if (f.filename == path) return f;
+  }
+  return null;
+}
+
+/** List files under a directory prefix (e.g. '/include') of a filesystem package. */
+export function listSharedFiles(name: string, dir: string): string[] {
+  ensureFilesystem(name);
+  let meta = fsMeta[name];
+  if (!meta || !meta.files) return [];
+  let result = [];
+  for (let f of meta.files) {
+    if (!dir || f.filename.startsWith(dir + '/')) result.push(f.filename);
+  }
+  return result.sort();
+}
+
+/// shared code in WASI filesystem zips (e.g. cc2600/cc7800 headers)
+// referenced by worker msgs as 'wasi:<zipname>'
+
+import { loadWASIFilesystemZip } from './wasiutils';
+import type { WASIMemoryFilesystem } from '../common/wasi/wasishim';
+
+var wasiFilesystems: { [zipname: string]: WASIMemoryFilesystem } = {};
+
+export async function ensureWasiFilesystem(zipname: string): Promise<WASIMemoryFilesystem | null> {
+  try {
+    if (!wasiFilesystems[zipname]) {
+      wasiFilesystems[zipname] = await loadWASIFilesystemZip(zipname);
+    }
+    return wasiFilesystems[zipname];
+  } catch (e) {
+    console.log('Error loading WASI filesystem', zipname, e);
+    return null;
+  }
+}
+
+// Stored file names are relative to the fs root; strip a leading '/'
+// so '/headers/vcs.h' matches 'headers/vcs.h'
+function normalizeWasiPath(path: string): string {
+  return path.startsWith('/') ? path.substring(1) : path;
+}
+
+/** Read a file from a WASI filesystem zip. Returns null if not found. */
+export async function readWasiSharedFile(zipname: string, path: string): Promise<Uint8Array | null> {
+  let fs = await ensureWasiFilesystem(zipname);
+  if (!fs) return null;
+  let norm = normalizeWasiPath(path);
+  let fd = fs.getFile(norm);
+  if (!fd || !fd.size) return null;
+  let data = new Uint8Array(fd.size);
+  fd.offset = 0;
+  fd.read(data);
+  return data;
+}
+
+/** List files under a directory prefix (e.g. '/headers') of a WASI filesystem zip. */
+export async function listWasiSharedFiles(zipname: string, dir: string): Promise<string[]> {
+  let fs = await ensureWasiFilesystem(zipname);
+  if (!fs) return [];
+  let prefix = normalizeWasiPath(dir) + '/';
+  return fs.getFiles()
+    .map(f => normalizeWasiPath(f.name))
+    .filter(name => name.startsWith(prefix))
+    .sort();
+}
+
+/** Read a file from a filesystem package blob. Returns null if not found.
+ *  Async because Blob reading is async; call from worker message handlers. */
+export async function readSharedFile(name: string, path: string): Promise<Uint8Array | null> {
+  let entry = getSharedFileEntry(name, path);
+  if (!entry || !fsBlob[name]) return null;
+  let blob: Blob = fsBlob[name].slice(entry.start, entry.end);
+  if (typeof Blob === 'undefined' || typeof blob['slice'] !== 'function') return null; // not a browser Blob
+  const FRS = (typeof globalThis !== 'undefined' ? (globalThis as any).FileReaderSync : undefined);
+  if (typeof FRS === 'function') {
+    return new Uint8Array(new FRS().readAsArrayBuffer(blob));
+  } else if (typeof FileReader !== 'undefined') {
+    return await new Promise<Uint8Array>((resolve, reject) => {
+      let fr = new FileReader();
+      fr.onload = () => resolve(new Uint8Array(fr.result as ArrayBuffer));
+      fr.onerror = () => reject(fr.error);
+      fr.readAsArrayBuffer(blob);
+    });
+  }
+  return null;
+}
+
+export function setupStdin(fs, code: string) {
+  var i = 0;
+  fs.init(
+    function () { return i < code.length ? code.charCodeAt(i++) : null; }
+  );
+}

@@ -1,0 +1,193 @@
+"use strict";
+// workerlib.ts - Node.js-friendly entry point for the worker build system
+// Re-exports core worker functionality without Web Worker onmessage/postMessage wiring
+// FOR TESTING ONLY
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.TOOLS = exports.PLATFORM_PARAMS = exports.builder = exports.store = exports.handleMessage = void 0;
+exports.setupNodeEnvironment = setupNodeEnvironment;
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+const builder_1 = require("./builder");
+Object.defineProperty(exports, "store", { enumerable: true, get: function () { return builder_1.store; } });
+Object.defineProperty(exports, "builder", { enumerable: true, get: function () { return builder_1.builder; } });
+const wasmutils_1 = require("./wasmutils");
+const workermain_1 = require("./workermain");
+Object.defineProperty(exports, "handleMessage", { enumerable: true, get: function () { return workermain_1.handleMessage; } });
+const gluehandlers_1 = require("./gluehandlers");
+var platforms_1 = require("./platforms");
+Object.defineProperty(exports, "PLATFORM_PARAMS", { enumerable: true, get: function () { return platforms_1.PLATFORM_PARAMS; } });
+var workertools_1 = require("./workertools");
+Object.defineProperty(exports, "TOOLS", { enumerable: true, get: function () { return workertools_1.TOOLS; } });
+class Blob {
+    constructor(parts) {
+        var list = Array.isArray(parts) ? parts : [parts];
+        var chunks = [];
+        var total = 0;
+        for (var p of list) {
+            var b;
+            if (typeof p == 'string') {
+                // a binary string: one byte per character
+                b = new Uint8Array(p.length);
+                for (var i = 0; i < p.length; i++)
+                    b[i] = p.charCodeAt(i) & 0xff;
+            }
+            else if (ArrayBuffer.isView(p)) {
+                b = new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+            }
+            else {
+                b = new Uint8Array(p);
+            }
+            chunks.push(b);
+            total += b.length;
+        }
+        this.bytes = new Uint8Array(total);
+        var off = 0;
+        for (var c of chunks) {
+            this.bytes.set(c, off);
+            off += c.length;
+        }
+        this.size = total;
+        this.length = total;
+    }
+    slice(a, b) {
+        return new Blob(this.bytes.slice(a, b));
+    }
+    arrayBuffer() {
+        return this.asArrayBuffer();
+    }
+    asArrayBuffer() {
+        return this.bytes.slice();
+    }
+}
+// The Emscripten glue running under Node adds uncaughtException and
+// unhandledRejection handlers every time a tool module is instantiated. They
+// rethrow or abort, which kills a long-lived host (the VS Code extension, the
+// CLI, a mocha worker), and they pile up, one pair per tool per build.
+// ignoreGlueProcessHandlers() drops the ones the glue adds; the build
+// catches tool errors itself.
+/**
+ * Set up the Node.js environment to provide XMLHttpRequest, fetch, and other
+ * browser globals that the worker build system expects.
+ * Call this once before using handleMessage/builder.
+ * `rootDir` is the directory holding src/worker (toolchain assets); it
+ * defaults to the current directory.
+ */
+function setupNodeEnvironment(rootDir = process.cwd()) {
+    var workerDir = path.resolve(rootDir, 'src/worker');
+    // Basic globals expected by various parts of the worker system
+    // Some Emscripten-generated WASM modules check for __filename/__dirname
+    if (typeof globalThis.__filename === 'undefined') {
+        globalThis.__filename = __filename;
+    }
+    if (typeof globalThis.__dirname === 'undefined') {
+        globalThis.__dirname = __dirname;
+        // TODO: support require('path').dirname
+    }
+    wasmutils_1.emglobal.window = wasmutils_1.emglobal;
+    wasmutils_1.emglobal.exports = {};
+    wasmutils_1.emglobal.self = wasmutils_1.emglobal;
+    wasmutils_1.emglobal.location = { href: '.' };
+    wasmutils_1.emglobal.path = path;
+    wasmutils_1.emglobal.btoa = require('btoa');
+    wasmutils_1.emglobal.atob = require('atob');
+    try {
+        wasmutils_1.emglobal.navigator = wasmutils_1.emglobal;
+    }
+    catch (e) { /* read-only in newer Node */ }
+    wasmutils_1.emglobal.ResizeObserver = class {
+        observe() { }
+    };
+    // XMLHttpRequest shim that reads from the local filesystem
+    wasmutils_1.emglobal.XMLHttpRequest = function () {
+        this.open = function (method, url, async) {
+            if (this.responseType == 'json') {
+                var txt = fs.readFileSync(path.resolve(workerDir, url), 'utf-8');
+                this.response = JSON.parse(txt);
+            }
+            else if (this.responseType == 'blob') {
+                var data = fs.readFileSync(path.resolve(workerDir, url), { encoding: 'binary' });
+                this.response = new Blob(data);
+            }
+            else if (this.responseType == 'arraybuffer') {
+                var data = fs.readFileSync(path.resolve(workerDir, url), { encoding: 'binary' });
+                this.response = new Blob(data).asArrayBuffer();
+            }
+            this.status = this.response ? 200 : 404;
+        };
+        this.send = function () { };
+    };
+    // Blob factory for the worker code (see wasmutils.makeBlob)
+    wasmutils_1.emglobal.makeBlob = (bytes) => new Blob(bytes);
+    // FileReaderSync shim
+    wasmutils_1.emglobal.FileReaderSync = function () {
+        this.readAsArrayBuffer = function (blob) {
+            return blob.asArrayBuffer();
+        };
+    };
+    // fetch shim that reads from the local filesystem
+    wasmutils_1.emglobal.fetch = function (filepath) {
+        return new Promise((resolve, reject) => {
+            try {
+                var bin = fs.readFileSync(path.resolve(rootDir, filepath), { encoding: 'binary' });
+                var response = new Blob(bin);
+                resolve(response);
+            }
+            catch (e) {
+                reject(e);
+            }
+        });
+    };
+    // importScripts shim - runs scripts in the global context like a web worker would.
+    // In the web worker, importScripts loads relative to the worker bundle.
+    // PWORKER is "../../src/worker/", so paths like "../../src/worker/asmjs/dasm.js"
+    // need to be resolved to the actual file on disk.
+    var vm = require('vm');
+    wasmutils_1.emglobal.importScripts = function (scriptPath) {
+        // Strip the PWORKER prefix and load from src/worker/
+        var resolved = scriptPath.replace(/^\.\.\/\.\.\//, '');
+        var fullPath = path.resolve(rootDir, resolved);
+        var code = fs.readFileSync(fullPath, 'utf-8');
+        (0, gluehandlers_1.noteGlueScript)(fullPath);
+        vm.runInThisContext(code, fullPath);
+    };
+    (0, gluehandlers_1.ignoreGlueProcessHandlers)();
+    // Suppress onmessage/postMessage (not used in Node mode)
+    wasmutils_1.emglobal.onmessage = null;
+    wasmutils_1.emglobal.postMessage = null;
+    // Set up the require function for WASM modules
+    (0, workermain_1.setupRequireFunction)();
+}
+//# sourceMappingURL=workerlib.js.map
